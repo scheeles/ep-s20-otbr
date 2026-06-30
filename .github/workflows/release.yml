@@ -1,0 +1,92 @@
+name: Release firmware
+
+on:
+  push:
+    tags:
+      - "v*"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    container:
+      image: espressif/idf:v6.0.1
+
+    env:
+      IDF_PATH: /opt/esp/idf
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+
+      - name: Build Dependency (ot_rcp)
+        run: |
+          . $IDF_PATH/export.sh
+          cd $IDF_PATH/examples/openthread/ot_rcp
+          idf.py set-target esp32h2
+          idf.py build
+
+      - name: Build Main S20-OTBR Application
+        run: |
+          . $IDF_PATH/export.sh
+          cd s20-otbr
+          idf.py build
+
+      - name: Combine binaries
+        run: |
+          . $IDF_PATH/export.sh
+          cd s20-otbr/build
+          python -m esptool \
+            --chip esp32s3 \
+            merge_bin \
+            -o combined.bin \
+            "@flash_args"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: esp32s3-otbr-firmware
+          path: |
+            s20-otbr/build/ota_with_rcp_image
+            s20-otbr/build/combined.bin
+            s20-otbr/build/s20_otbr.bin
+            s20-otbr/build/web_storage.bin
+            s20-otbr/build/rcp_fw.bin
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: esp32s3-otbr-firmware
+          path: ./artifacts
+
+      - name: Create GitHub Release and Upload Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME=${{ github.ref_name }}
+
+          echo "Creating release for tag: $TAG_NAME"
+
+          gh release create "$TAG_NAME" \
+            ./artifacts/ota_with_rcp_image \
+            ./artifacts/combined.bin \
+            ./artifacts/s20_otbr.bin \
+            ./artifacts/web_storage.bin \
+            ./artifacts/rcp_fw.bin \
+            --title "Release $TAG_NAME" \
+            --generate-notes
