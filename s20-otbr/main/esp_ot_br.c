@@ -29,6 +29,7 @@
 
 #include "border_router_launch.h"
 #include "esp_br_web.h"
+#include "net_syslog.h"
 #include "nvs_config.h"
 
 #include "led.h"
@@ -110,6 +111,17 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
     ESP_LOGI(TAG, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
     ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
     ESP_LOGI(TAG, "~~~~~~~~~~~");
+
+#if CONFIG_NET_SYSLOG_ENABLED
+    /* Start remote logging only now that the netif is up. Idempotent, so DHCP
+     * renewals and link flaps re-entering this handler are harmless. */
+    {
+        char hostname_buf[64];
+        esp_err_t hostname_err = nvs_config_get(NVS_CONFIG_KEY_HOSTNAME, hostname_buf, sizeof(hostname_buf));
+        net_syslog_start(CONFIG_NET_SYSLOG_SERVER_IP, CONFIG_NET_SYSLOG_SERVER_PORT,
+                         hostname_err == ESP_OK ? hostname_buf : CONFIG_NET_SYSLOG_HOSTNAME);
+    }
+#endif
 }
 
 static void thread_event_handler(void *esp_netif, esp_event_base_t event_base, int32_t event_id, void *data)
