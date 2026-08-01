@@ -69,7 +69,7 @@ More [flashing procedures](docs/moreflash.md).
 
 ## Remote logging (syslog)
 
-The device has no serial tether in production, so the `net_syslog` module mirrors
+The device has no serial tether in production, so the `net_syslog` component mirrors
 the ESP-IDF log stream to a remote **RFC3164 UDP syslog** server (e.g. a Grafana
 Alloy `loki.source.syslog` listener). It chains onto the existing
 `esp_log_set_vprintf()` handler, so **UART/console logging is unchanged** — syslog
@@ -87,41 +87,52 @@ letter (`E`→err/131, `W`→warning/132, `I`→info/134, `D`/`V`→debug/135), 
 receiver can label severity. ANSI colour escapes are stripped. The device clock is
 usually wrong — the receiver should stamp its own arrival time.
 
-Enable it in `idf.py menuconfig` under **Network syslog Configuration**:
+### Setting the server
+
+The firmware ships with remote logging compiled in but **dormant**. Set the server
+under **Network → Remote Logging** in the web UI; it is stored in NVS and applied
+immediately, with no reboot and no rebuild. Clearing the server field switches
+remote logging back off. This is what lets several border routers run one identical
+firmware image and still log to different collectors.
+
+The RFC3164 HOSTNAME field follows the device hostname (**Network → Hostname**, the
+same value used for mDNS), so hosts stay distinguishable in Loki. Unlike the server,
+a hostname change applies on the next reboot.
+
+The same settings are reachable over the API:
+
+```
+$ curl http://<device>/config
+$ curl -X PUT http://<device>/config -d '{"syslog_srv":"192.168.1.10","syslog_port":"514"}'
+$ curl -X PUT http://<device>/config -d '{"syslog_srv":""}'      # switch off
+```
+
+### Build-time defaults
+
+The Kconfig options under **Network syslog** only supply the fallback used when
+nothing is stored in NVS — a device that has never been configured:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `CONFIG_NET_SYSLOG_ENABLED` | `n` | Master switch for remote logging |
-| `CONFIG_NET_SYSLOG_SERVER_IP` | `192.168.1.10` | Syslog server IPv4 (dotted-quad, no DNS) |
-| `CONFIG_NET_SYSLOG_SERVER_PORT` | `514` | Destination UDP port |
-| `CONFIG_NET_SYSLOG_HOSTNAME` | `ep-s20-otbr` | RFC3164 HOSTNAME fallback |
+| `CONFIG_NET_SYSLOG_ENABLED` | `y` (via `sdkconfig.defaults`) | Compile the component in and expose the UI card |
+| `CONFIG_NET_SYSLOG_SERVER_IP` | `""` | Fallback server; empty means dormant until set in the UI |
+| `CONFIG_NET_SYSLOG_SERVER_PORT` | `514` | Fallback UDP port |
+| `CONFIG_NET_SYSLOG_HOSTNAME` | `ep-s20-otbr` | Fallback HOSTNAME when none is stored |
 
-or in `sdkconfig.defaults`:
+Setting `CONFIG_NET_SYSLOG_SERVER_IP` is only useful to pre-provision a fleet that
+should start logging on first boot.
 
-```
-CONFIG_NET_SYSLOG_ENABLED=y
-CONFIG_NET_SYSLOG_SERVER_IP="192.168.1.10"
-CONFIG_NET_SYSLOG_SERVER_PORT=514
-CONFIG_NET_SYSLOG_HOSTNAME="ep-s20-otbr"
-```
+### Notes
 
-The HOSTNAME field prefers the hostname stored in NVS (the same one used for mDNS,
-settable from the web UI) and falls back to `CONFIG_NET_SYSLOG_HOSTNAME`, so several
-border routers stay distinguishable without per-device builds.
+The component is started from the got-IP handler in
+[`main/esp_ot_br.c`](s20-otbr/main/esp_ot_br.c) — never earlier, or the socket setup
+races the netif. The call is idempotent, so DHCP renewals re-entering the handler
+will not undo a server configured from the UI.
 
-It is started from the got-IP handler in [`main/esp_ot_br.c`](s20-otbr/main/esp_ot_br.c)
-— never earlier, or the socket setup races the netif:
-
-```c
-net_syslog_start(CONFIG_NET_SYSLOG_SERVER_IP, CONFIG_NET_SYSLOG_SERVER_PORT, hostname);
-```
-
-The call is idempotent, so DHCP renewals re-entering the handler are harmless.
-
-The hook formats on the caller's stack (bounded buffers, no heap): a logging task
-needs roughly 1.1 kB of headroom. Shrink `SYSLOG_MSG_MAX` / `SYSLOG_PKT_MAX` in
-[`main/net_syslog.c`](s20-otbr/main/net_syslog.c) if a task with a tight stack has
-to log.
+The log hook formats on the caller's stack (bounded buffers, no heap): a logging
+task needs roughly 1.1 kB of headroom. Shrink `SYSLOG_MSG_MAX` / `SYSLOG_PKT_MAX` in
+[`components/net_syslog/src/net_syslog.c`](s20-otbr/components/net_syslog/src/net_syslog.c)
+if a task with a tight stack has to log.
 
 To verify on the receiving host:
 
