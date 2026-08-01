@@ -14,6 +14,8 @@ extern "C" {
 #define NVS_CONFIG_KEY_TH_TXPWR "th_txpwr"
 #define NVS_CONFIG_KEY_TH_LDR_WT "th_ldr_wt"
 #define NVS_CONFIG_KEY_TH_TREL "th_trel"
+#define NVS_CONFIG_KEY_SYSLOG_SRV "syslog_srv"
+#define NVS_CONFIG_KEY_SYSLOG_PORT "syslog_port"
 
 /**
  * @brief Initialize the NVS config component with a given namespace.

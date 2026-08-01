@@ -1,6 +1,5 @@
 idf_component_register(SRCS "esp_ot_br.c"
                        "led.c"
-                       "net_syslog.c"
                        INCLUDE_DIRS "."
                        REQUIRES esp_coex
                                 esp_eth
@@ -9,9 +8,8 @@ idf_component_register(SRCS "esp_ot_br.c"
                                 esp_ot_br_server
                                 esp_ot_cli_extension
                                 esp_driver_uart
-                                log
-                                lwip
                                 mdns
+                                net_syslog
                                 nvs_config
                                 nvs_flash
                                 openthread

@@ -17,38 +17,3 @@ menu "Firmware version Configuration"
         default ""
 
 endmenu
-
-menu "Network syslog Configuration"
-
-    config NET_SYSLOG_ENABLED
-        bool "Mirror logs to a remote UDP syslog server"
-        default n
-        help
-            Mirror the ESP-IDF log stream to a remote RFC3164 UDP syslog server
-            (e.g. a Grafana Alloy loki.source.syslog listener). Purely additive:
-            UART/console logging is unaffected. The socket is opened once the
-            device has an IP address.
-
-    config NET_SYSLOG_SERVER_IP
-        string "Syslog server IPv4 address"
-        depends on NET_SYSLOG_ENABLED
-        default "192.168.1.10"
-        help
-            Dotted-quad IPv4 address of the syslog server. Hostnames are not
-            resolved: remote logging must not depend on DNS being up.
-
-    config NET_SYSLOG_SERVER_PORT
-        int "Syslog server UDP port"
-        depends on NET_SYSLOG_ENABLED
-        range 1 65535
-        default 514
-
-    config NET_SYSLOG_HOSTNAME
-        string "Syslog HOSTNAME field"
-        depends on NET_SYSLOG_ENABLED
-        default "ep-s20-otbr"
-        help
-            Fallback value for the RFC3164 HOSTNAME field, used when no hostname
-            is stored in NVS. Spaces are replaced with underscores.
-
-endmenu
