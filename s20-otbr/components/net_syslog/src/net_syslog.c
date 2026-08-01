@@ -48,10 +48,17 @@
 #define SYSLOG_SEVERITY_DEBUG 7
 
 static volatile int s_sock = -1;
-static struct sockaddr_in s_dest;
 static char s_hostname[SYSLOG_HOSTNAME_MAX] = "esp32";
 static vprintf_like_t s_next_vprintf = NULL;
 static bool s_started = false;
+
+/* Destination double buffer. net_syslog_set_server() fills the spare slot and
+ * then publishes it with a single write to s_dest_idx, so a concurrent logger
+ * either sees the whole old address or the whole new one — never a half-written
+ * one — without taking a lock on the logging hot path. */
+static struct sockaddr_in s_dest[2];
+static volatile uint8_t s_dest_idx = 0;
+static volatile bool s_dest_valid = false;
 
 /* Recursion guard. Recursion is by definition same-task, so remembering the
  * task currently inside the send path is enough and needs no lock: concurrent
@@ -132,10 +139,14 @@ static void net_syslog_emit(int sock, const char *fmt, va_list args)
     char msg[SYSLOG_MSG_MAX];
     char pkt[SYSLOG_PKT_MAX];
     char timestamp[SYSLOG_TIMESTAMP_MAX];
+    const struct sockaddr_in *dest;
     struct tm utc;
     time_t now;
     size_t len;
     int written;
+
+    /* Read the published slot index exactly once. */
+    dest = &s_dest[s_dest_idx & 1];
 
     written = vsnprintf(msg, sizeof(msg), fmt, args);
     if (written <= 0) {
@@ -164,7 +175,7 @@ static void net_syslog_emit(int sock, const char *fmt, va_list args)
     }
     len = (written < (int)sizeof(pkt)) ? (size_t)written : sizeof(pkt) - 1;
 
-    (void)sendto(sock, pkt, len, MSG_DONTWAIT, (struct sockaddr *)&s_dest, sizeof(s_dest));
+    (void)sendto(sock, pkt, len, MSG_DONTWAIT, (const struct sockaddr *)dest, sizeof(*dest));
 }
 
 /**
@@ -188,7 +199,7 @@ static int net_syslog_vprintf(const char *fmt, va_list args)
     va_end(chain_args);
 
     sock = s_sock;
-    if (sock < 0) {
+    if (sock < 0 || !s_dest_valid) {
         return ret;
     }
 
@@ -207,26 +218,59 @@ static int net_syslog_vprintf(const char *fmt, va_list args)
     return ret;
 }
 
-void net_syslog_start(const char *server_ip, uint16_t port, const char *hostname)
+esp_err_t net_syslog_set_server(const char *server_ip, uint16_t port)
 {
     struct sockaddr_in dest;
-    int flags;
-    int sock;
+    uint8_t spare;
 
-    if (s_started) {
-        return;
-    }
     if (server_ip == NULL || server_ip[0] == '\0' || port == 0) {
-        ESP_LOGW(TAG, "No syslog server configured, remote logging disabled");
-        return;
+        /* Stop sending, but keep the socket and the hook in place so a server
+         * can be configured again later without a reboot. */
+        s_dest_valid = false;
+        ESP_LOGI(TAG, "Remote syslog disabled");
+        return ESP_OK;
     }
 
     memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
     dest.sin_port = htons(port);
     if (inet_pton(AF_INET, server_ip, &dest.sin_addr) != 1) {
-        ESP_LOGW(TAG, "Invalid syslog server address '%s', remote logging disabled", server_ip);
+        ESP_LOGW(TAG, "Invalid syslog server address '%s', keeping previous setting", server_ip);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Fill the slot the log hook is not reading, then publish it. */
+    spare = (uint8_t)((s_dest_idx & 1) ^ 1);
+    s_dest[spare] = dest;
+    s_dest_idx = spare;
+    s_dest_valid = true;
+
+    ESP_LOGI(TAG, "Mirroring logs to syslog://%s:%u as '%s'", server_ip, (unsigned)port, s_hostname);
+    return ESP_OK;
+}
+
+void net_syslog_start(const char *server_ip, uint16_t port, const char *hostname)
+{
+    int flags;
+    int sock;
+
+    if (s_started) {
+        /* Already running: treat a repeated call as a destination update so a
+         * DHCP renewal cannot undo a server configured from the web UI. */
+        if (server_ip != NULL && server_ip[0] != '\0' && port != 0) {
+            net_syslog_set_server(server_ip, port);
+        }
         return;
+    }
+
+    if (hostname != NULL && hostname[0] != '\0') {
+        snprintf(s_hostname, sizeof(s_hostname), "%s", hostname);
+        /* The RFC3164 HOSTNAME field is space delimited. */
+        for (char *cursor = s_hostname; *cursor != '\0'; ++cursor) {
+            if (*cursor == ' ') {
+                *cursor = '_';
+            }
+        }
     }
 
     sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -243,21 +287,16 @@ void net_syslog_start(const char *server_ip, uint16_t port, const char *hostname
         return;
     }
 
-    if (hostname != NULL && hostname[0] != '\0') {
-        snprintf(s_hostname, sizeof(s_hostname), "%s", hostname);
-        /* The RFC3164 HOSTNAME field is space delimited. */
-        for (char *cursor = s_hostname; *cursor != '\0'; ++cursor) {
-            if (*cursor == ' ') {
-                *cursor = '_';
-            }
-        }
-    }
+    /* Set the destination before the hook can observe the socket. A bad or
+     * empty address simply leaves the module dormant until the web UI
+     * configures one. */
+    net_syslog_set_server(server_ip, port);
 
-    /* Publish the destination and the socket before the hook can observe them. */
-    s_dest = dest;
     s_sock = sock;
     s_next_vprintf = esp_log_set_vprintf(net_syslog_vprintf);
     s_started = true;
 
-    ESP_LOGI(TAG, "Mirroring logs to syslog://%s:%u as '%s'", server_ip, (unsigned)port, s_hostname);
+    if (!s_dest_valid) {
+        ESP_LOGI(TAG, "Remote syslog ready, waiting for a server to be configured");
+    }
 }

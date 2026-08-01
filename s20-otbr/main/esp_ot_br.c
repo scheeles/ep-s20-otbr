@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,12 +115,29 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
 
 #if CONFIG_NET_SYSLOG_ENABLED
     /* Start remote logging only now that the netif is up. Idempotent, so DHCP
-     * renewals and link flaps re-entering this handler are harmless. */
+     * renewals and link flaps re-entering this handler are harmless. The
+     * endpoint is normally set from the web UI and kept in NVS; the Kconfig
+     * values are only the fallback for a device that has never been
+     * configured. */
     {
         char hostname_buf[64];
-        esp_err_t hostname_err = nvs_config_get(NVS_CONFIG_KEY_HOSTNAME, hostname_buf, sizeof(hostname_buf));
-        net_syslog_start(CONFIG_NET_SYSLOG_SERVER_IP, CONFIG_NET_SYSLOG_SERVER_PORT,
-                         hostname_err == ESP_OK ? hostname_buf : CONFIG_NET_SYSLOG_HOSTNAME);
+        char syslog_srv[64];
+        char syslog_port[8];
+        uint16_t port = CONFIG_NET_SYSLOG_SERVER_PORT;
+
+        if (nvs_config_get(NVS_CONFIG_KEY_SYSLOG_SRV, syslog_srv, sizeof(syslog_srv)) != ESP_OK) {
+            snprintf(syslog_srv, sizeof(syslog_srv), "%s", CONFIG_NET_SYSLOG_SERVER_IP);
+        }
+        if (nvs_config_get(NVS_CONFIG_KEY_SYSLOG_PORT, syslog_port, sizeof(syslog_port)) == ESP_OK) {
+            int stored = atoi(syslog_port);
+            if (stored > 0 && stored <= UINT16_MAX) {
+                port = (uint16_t)stored;
+            }
+        }
+        if (nvs_config_get(NVS_CONFIG_KEY_HOSTNAME, hostname_buf, sizeof(hostname_buf)) != ESP_OK) {
+            snprintf(hostname_buf, sizeof(hostname_buf), "%s", CONFIG_NET_SYSLOG_HOSTNAME);
+        }
+        net_syslog_start(syslog_srv, port, hostname_buf);
     }
 #endif
 }
