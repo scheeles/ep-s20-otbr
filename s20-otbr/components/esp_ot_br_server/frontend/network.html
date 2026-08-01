@@ -30,6 +30,25 @@
                 </div>
             </div>
         </div>
+        <!-- Remote syslog -->
+        <div class="card section" id="syslogCard" style="display:none">
+            <div class="card-header">Remote Logging</div>
+            <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px">
+                Mirror this device's log to a remote syslog server over UDP (RFC3164). Applied immediately and
+                persisted across reboots. Console logging is unaffected. Leave the server empty to switch remote
+                logging off.
+            </p>
+            <div class="flex-between" style="gap:10px;flex-wrap:wrap">
+                <input class="form-input" type="text" id="syslogSrvInput" placeholder="192.168.1.10"
+                    style="max-width:220px;flex:1" maxlength="45">
+                <input class="form-input" type="number" id="syslogPortInput" placeholder="514" value="514"
+                    style="max-width:110px" min="1" max="65535">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-primary btn-sm" id="syslogSaveBtn" onclick="saveSyslog()">Save</button>
+                    <span id="syslogStatus" style="font-size:13px"></span>
+                </div>
+            </div>
+        </div>
         <!-- Network Addresses -->
         <div class="card section">
             <div class="flex-between mb-16">
@@ -98,11 +117,53 @@
 
         function loadHostname() {
             apiGet('/config').then(function (data) {
-                var h = (data && data.result && data.result.hostname) ? data.result.hostname : '';
-                if (h) {
-                    document.getElementById('hostnameInput').value = h;
+                var cfg = (data && data.result) ? data.result : {};
+                if (cfg.hostname) {
+                    document.getElementById('hostnameInput').value = cfg.hostname;
+                }
+                /* The syslog keys are absent entirely when the feature is not
+                   compiled in, so only offer the card when the device knows
+                   about them. A null value just means "not configured yet". */
+                if (Object.prototype.hasOwnProperty.call(cfg, 'syslog_srv')) {
+                    document.getElementById('syslogCard').style.display = '';
+                    if (cfg.syslog_srv) {
+                        document.getElementById('syslogSrvInput').value = cfg.syslog_srv;
+                    }
+                    if (cfg.syslog_port) {
+                        document.getElementById('syslogPortInput').value = cfg.syslog_port;
+                    }
                 }
             }).catch(function () { /* ignore — leave placeholder */ });
+        }
+
+        function saveSyslog() {
+            var srv = document.getElementById('syslogSrvInput').value.trim();
+            var port = document.getElementById('syslogPortInput').value.trim() || '514';
+            var status = document.getElementById('syslogStatus');
+            var btn = document.getElementById('syslogSaveBtn');
+            if (srv && !/^(\d{1,3}\.){3}\d{1,3}$/.test(srv)) {
+                status.textContent = 'Enter an IPv4 address';
+                status.style.color = 'var(--danger)';
+                return;
+            }
+            var portNum = parseInt(port, 10);
+            if (!(portNum >= 1 && portNum <= 65535)) {
+                status.textContent = 'Port must be 1-65535';
+                status.style.color = 'var(--danger)';
+                return;
+            }
+            btn.disabled = true;
+            status.textContent = 'Saving...';
+            status.style.color = 'var(--text-muted)';
+            apiPut('/config', { syslog_srv: srv, syslog_port: String(portNum) }).then(function () {
+                status.textContent = srv ? 'Saved' : 'Remote logging off';
+                status.style.color = srv ? 'var(--success)' : 'var(--text-muted)';
+            }).catch(function () {
+                status.textContent = 'Failed to save';
+                status.style.color = 'var(--danger)';
+            }).then(function () {
+                btn.disabled = false;
+            });
         }
 
         function saveHostname() {

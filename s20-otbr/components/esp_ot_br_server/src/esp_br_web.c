@@ -38,6 +38,9 @@
 #include "esp_vfs.h"
 #include "http_parser.h"
 #include "protocol_examples_common.h"
+#if CONFIG_NET_SYSLOG_ENABLED
+#include "net_syslog.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -2814,7 +2817,12 @@ static esp_err_t esp_otbr_config_get_handler(httpd_req_t *req)
 
     /* Read each well-known key; omit keys that have no stored value */
     static const char *const keys[] = {
-        NVS_CONFIG_KEY_HOSTNAME, NVS_CONFIG_KEY_WIFI_SSID, NVS_CONFIG_KEY_TH_TXPWR, NVS_CONFIG_KEY_TH_LDR_WT, NULL,
+        NVS_CONFIG_KEY_HOSTNAME,   NVS_CONFIG_KEY_WIFI_SSID, NVS_CONFIG_KEY_TH_TXPWR,
+        NVS_CONFIG_KEY_TH_LDR_WT,
+#if CONFIG_NET_SYSLOG_ENABLED
+        NVS_CONFIG_KEY_SYSLOG_SRV, NVS_CONFIG_KEY_SYSLOG_PORT,
+#endif
+        NULL,
     };
     for (int i = 0; keys[i] != NULL; i++) {
         if (nvs_config_get(keys[i], buf, sizeof(buf)) == ESP_OK) {
@@ -2900,6 +2908,49 @@ static esp_err_t esp_otbr_config_put_handler(httpd_req_t *req)
             any_set = true;
         }
     }
+
+#if CONFIG_NET_SYSLOG_ENABLED
+    /* Remote syslog endpoint. An empty server string is meaningful: it switches
+     * remote logging off. Both keys are persisted first, then the effective
+     * pair is applied to the running log hook, so a change takes effect
+     * immediately without a reboot. */
+    bool syslog_changed = false;
+
+    cJSON *slsrv_j = cJSON_GetObjectItemCaseSensitive(request, NVS_CONFIG_KEY_SYSLOG_SRV);
+    if (cJSON_IsString(slsrv_j) && slsrv_j->valuestring) {
+        if (nvs_config_set(NVS_CONFIG_KEY_SYSLOG_SRV, slsrv_j->valuestring) == ESP_OK) {
+            syslog_changed = true;
+            any_set = true;
+        }
+    }
+
+    cJSON *slport_j = cJSON_GetObjectItemCaseSensitive(request, NVS_CONFIG_KEY_SYSLOG_PORT);
+    if (cJSON_IsString(slport_j) && slport_j->valuestring && slport_j->valuestring[0] != '\0') {
+        int port = atoi(slport_j->valuestring);
+        if (port > 0 && port <= UINT16_MAX &&
+            nvs_config_set(NVS_CONFIG_KEY_SYSLOG_PORT, slport_j->valuestring) == ESP_OK) {
+            syslog_changed = true;
+            any_set = true;
+        }
+    }
+
+    if (syslog_changed) {
+        char syslog_srv[64];
+        char syslog_port[8];
+        uint16_t port = CONFIG_NET_SYSLOG_SERVER_PORT;
+
+        if (nvs_config_get(NVS_CONFIG_KEY_SYSLOG_SRV, syslog_srv, sizeof(syslog_srv)) != ESP_OK) {
+            syslog_srv[0] = '\0';
+        }
+        if (nvs_config_get(NVS_CONFIG_KEY_SYSLOG_PORT, syslog_port, sizeof(syslog_port)) == ESP_OK) {
+            int stored = atoi(syslog_port);
+            if (stored > 0 && stored <= UINT16_MAX) {
+                port = (uint16_t)stored;
+            }
+        }
+        net_syslog_set_server(syslog_srv, port);
+    }
+#endif /* CONFIG_NET_SYSLOG_ENABLED */
 
     if (any_set) {
         error = cJSON_CreateNumber((double)ESP_OK);
