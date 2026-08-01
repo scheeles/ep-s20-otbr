@@ -67,6 +67,69 @@ $ ./script/push-update.sh <IP-ADDRESS>
 
 More [flashing procedures](docs/moreflash.md).
 
+## Remote logging (syslog)
+
+The device has no serial tether in production, so the `net_syslog` module mirrors
+the ESP-IDF log stream to a remote **RFC3164 UDP syslog** server (e.g. a Grafana
+Alloy `loki.source.syslog` listener). It chains onto the existing
+`esp_log_set_vprintf()` handler, so **UART/console logging is unchanged** — syslog
+is purely additive. Sends are best-effort and non-blocking on a cached UDP socket;
+if the network is down or the queue is full, lines are silently dropped.
+
+Each packet looks like:
+
+```
+<134>Jan  1 00:00:00 ep-s20-otbr otbr: I (5213) s20-otbr: Ethernet Got IP Address
+```
+
+The PRI encodes facility `local0` plus the severity mapped from the ESP-IDF level
+letter (`E`→err/131, `W`→warning/132, `I`→info/134, `D`/`V`→debug/135), so the
+receiver can label severity. ANSI colour escapes are stripped. The device clock is
+usually wrong — the receiver should stamp its own arrival time.
+
+Enable it in `idf.py menuconfig` under **Network syslog Configuration**:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `CONFIG_NET_SYSLOG_ENABLED` | `n` | Master switch for remote logging |
+| `CONFIG_NET_SYSLOG_SERVER_IP` | `192.168.1.10` | Syslog server IPv4 (dotted-quad, no DNS) |
+| `CONFIG_NET_SYSLOG_SERVER_PORT` | `514` | Destination UDP port |
+| `CONFIG_NET_SYSLOG_HOSTNAME` | `ep-s20-otbr` | RFC3164 HOSTNAME fallback |
+
+or in `sdkconfig.defaults`:
+
+```
+CONFIG_NET_SYSLOG_ENABLED=y
+CONFIG_NET_SYSLOG_SERVER_IP="192.168.1.10"
+CONFIG_NET_SYSLOG_SERVER_PORT=514
+CONFIG_NET_SYSLOG_HOSTNAME="ep-s20-otbr"
+```
+
+The HOSTNAME field prefers the hostname stored in NVS (the same one used for mDNS,
+settable from the web UI) and falls back to `CONFIG_NET_SYSLOG_HOSTNAME`, so several
+border routers stay distinguishable without per-device builds.
+
+It is started from the got-IP handler in [`main/esp_ot_br.c`](s20-otbr/main/esp_ot_br.c)
+— never earlier, or the socket setup races the netif:
+
+```c
+net_syslog_start(CONFIG_NET_SYSLOG_SERVER_IP, CONFIG_NET_SYSLOG_SERVER_PORT, hostname);
+```
+
+The call is idempotent, so DHCP renewals re-entering the handler are harmless.
+
+The hook formats on the caller's stack (bounded buffers, no heap): a logging task
+needs roughly 1.1 kB of headroom. Shrink `SYSLOG_MSG_MAX` / `SYSLOG_PKT_MAX` in
+[`main/net_syslog.c`](s20-otbr/main/net_syslog.c) if a task with a tight stack has
+to log.
+
+To verify on the receiving host:
+
+```
+$ nc -u -l -p 514
+$ tcpdump -nAi any udp port 514
+```
+
 ## Integrating with Home Assistant
 
 See [Home Assistant](docs/homeassistant.md).
