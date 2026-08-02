@@ -1,0 +1,147 @@
+name: Build firmware
+
+# Builds on every pull request and every push to main, and is reused by the
+# release workflow via workflow_call. Sharing one definition is the point: if
+# PR builds diverged from release builds, a green PR would stop being evidence
+# that the release will build.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_call:
+    inputs:
+      verify_tag:
+        description: >-
+          Release tag the built firmware must report as its version.
+          Empty (the default) skips the check, which is what PR builds want.
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  # Distinct per caller: a reusable-workflow run inherits the caller's
+  # github.workflow, so release runs never share a group with PR runs.
+  # Superseded PR builds are cancelled; release builds are never cancelled.
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Host tests for net_syslog: seconds, no hardware, and they cover the failure
+  # modes a compile cannot see — in particular that no socket call happens on a
+  # logging task, which is what deadlocked lwip and bricked a device.
+  test:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+
+      - name: Run net_syslog host tests
+        run: make -C s20-otbr/components/net_syslog/test
+
+      - name: Run net_syslog host tests under sanitizers
+        run: make -C s20-otbr/components/net_syslog/test clean sanitize
+
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    container:
+      image: espressif/idf:v6.0.2
+
+    env:
+      IDF_PATH: /opt/esp/idf
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+
+      # actions/checkout marks the workspace safe in a *temporary* HOME on the
+      # runner, which the git inside this container never sees: it runs as a
+      # different user, so every git call fails with "detected dubious
+      # ownership". ESP-IDF silently falls back to PROJECT_VER=1 when its
+      # `git describe` fails, which makes the firmware report version "1" and
+      # the OTA update check offer an update forever. Re-declare it here so the
+      # container's git trusts the checkout and its submodules.
+      - name: Trust checkout inside the build container
+        run: git config --global --add safe.directory '*'
+
+      - name: Build Dependency (ot_rcp)
+        run: |
+          . $IDF_PATH/export.sh
+          cd $IDF_PATH/examples/openthread/ot_rcp
+          idf.py set-target esp32h2
+          idf.py build
+
+      - name: Build Main S20-OTBR Application
+        run: |
+          . $IDF_PATH/export.sh
+          cd s20-otbr
+          idf.py build
+
+      # ESP-IDF falls back to PROJECT_VER=1 whenever `git describe` fails, and
+      # only reports it as a STATUS line, so the build stays green while the
+      # firmware ships an unusable version. Fail loudly instead.
+      - name: Verify firmware version matches the release tag
+        # Truthiness, not a comparison: `inputs` is null outside workflow_call.
+        if: inputs.verify_tag
+        run: |
+          TAG_NAME='${{ inputs.verify_tag }}'
+          VERSION=$(python -c "import json; print(json.load(open('s20-otbr/build/project_description.json'))['project_version'])")
+          echo "PROJECT_VER=$VERSION, tag=$TAG_NAME"
+          if [ "$VERSION" != "$TAG_NAME" ]; then
+            echo "::error::Firmware reports version '$VERSION' instead of '$TAG_NAME'. The OTA update check compares this against the latest release tag, so a mismatch makes every device offer an update forever."
+            exit 1
+          fi
+
+      - name: Report build size
+        # Reporting only: never fail a build because the summary could not be
+        # produced.
+        continue-on-error: true
+        run: |
+          . $IDF_PATH/export.sh
+          cd s20-otbr
+          VERSION=$(python -c "import json; print(json.load(open('build/project_description.json'))['project_version'])")
+          {
+            echo "### Firmware build"
+            echo
+            echo "Reported version: \`${VERSION}\`"
+            echo
+            echo '```'
+            idf.py size 2>/dev/null | tail -n 20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Combine binaries
+        run: |
+          . $IDF_PATH/export.sh
+          cd s20-otbr/build
+          python -m esptool \
+            --chip esp32s3 \
+            merge_bin \
+            -o combined.bin \
+            "@flash_args"
+
+      # Uploaded for PR builds too, so a change can be flashed on the bench
+      # before it is merged and tagged.
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: esp32s3-otbr-firmware
+          path: |
+            s20-otbr/build/ota_with_rcp_image
+            s20-otbr/build/combined.bin
+            s20-otbr/build/s20_otbr.bin
+            s20-otbr/build/web_storage.bin
+            s20-otbr/build/rcp_fw.bin
+          if-no-files-found: error
+          retention-days: 14
