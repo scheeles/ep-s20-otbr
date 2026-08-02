@@ -24,6 +24,7 @@
 #include "nvs_flash.h"
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
+#include "openthread/logging.h"
 #include "openthread/platform/radio.h"
 #include "openthread/thread_ftd.h"
 #include "openthread/trel.h"
@@ -163,6 +164,13 @@ static void thread_event_handler(void *esp_netif, esp_event_base_t event_base, i
             bool enabled = atoi(param_buf) != 0;
             otTrelSetEnabled(instance, enabled);
             ESP_LOGI(TAG, "Thread TREL state restored: %d", enabled);
+        }
+        if (nvs_config_get(NVS_CONFIG_KEY_TH_LOG_LVL, param_buf, sizeof(param_buf)) == ESP_OK) {
+            int level = atoi(param_buf);
+            if (level >= OT_LOG_LEVEL_NONE && level <= OT_LOG_LEVEL_DEBG &&
+                otLoggingSetLevel((otLogLevel)level) == OT_ERROR_NONE) {
+                ESP_LOGI(TAG, "Thread log level restored: %d", level);
+            }
         }
     } else if (event_id == OPENTHREAD_EVENT_ATTACHED) {
         ESP_LOGI(TAG, "======OPENTHREAD_EVENT_ATTACHED======");

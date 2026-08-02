@@ -47,6 +47,18 @@
                     <button class="btn btn-primary" id="setTransmitPowerBtn" onclick="setTransmitPower()">Set
                         Power</button>
                 </div>
+                <div style="margin-left:10px;margin-bottom:0">
+                    <label class="form-label">OpenThread Log Level</label>
+                    <select class="form-input" style="width:auto" id="otLogLevelSelect">
+                        <option value="0">None</option>
+                        <option value="1">Critical</option>
+                        <option value="2">Warning</option>
+                        <option value="3">Note</option>
+                        <option value="4">Info</option>
+                        <option value="5">Debug</option>
+                    </select>
+                    <button class="btn btn-primary" id="setOtLogLevelBtn" onclick="setOtLogLevel()">Set Level</button>
+                </div>
             </div>
             <div id="leaderStatus" style="font-size:13px;margin-top:10px"></div>
         </div>
@@ -455,6 +467,11 @@
                     if (res.result.th_txpwr != null) {
                         document.getElementById('transmitPowerInput').value = res.result.th_txpwr;
                     }
+                    /* Reported live by the device, so it is accurate even when
+                       nothing was ever stored in NVS. */
+                    if (res.result.th_log_lvl != null) {
+                        document.getElementById('otLogLevelSelect').value = String(res.result.th_log_lvl);
+                    }
                 }
             }).catch(function () { /* ignore — keep defaults */ });
         });
@@ -552,6 +569,32 @@
             status.style.color = 'var(--text-muted)';
             apiPut('/config', { th_txpwr: String(val) }).then(function () {
                 status.textContent = 'Transmit power set to ' + val + ' dBm';
+                status.style.color = 'var(--success)';
+            }).catch(function () {
+                status.textContent = 'Network error';
+                status.style.color = 'var(--danger)';
+            }).then(function () {
+                btn.disabled = false;
+            });
+        }
+
+        /* ──── OpenThread Log Level ──── */
+        function setOtLogLevel() {
+            var select = document.getElementById('otLogLevelSelect');
+            var status = document.getElementById('leaderStatus');
+            var btn = document.getElementById('setOtLogLevelBtn');
+            var val = parseInt(select.value, 10);
+            if (isNaN(val) || val < 0 || val > 5) {
+                status.textContent = 'Invalid log level';
+                status.style.color = 'var(--danger)';
+                return;
+            }
+            btn.disabled = true;
+            status.textContent = 'Setting log level...';
+            status.style.color = 'var(--text-muted)';
+            apiPut('/config', { th_log_lvl: String(val) }).then(function () {
+                status.textContent = 'OpenThread log level set to ' +
+                    select.options[select.selectedIndex].text;
                 status.style.color = 'var(--success)';
             }).catch(function () {
                 status.textContent = 'Network error';
