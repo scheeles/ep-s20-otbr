@@ -28,6 +28,7 @@
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
 #include "esp_openthread_lock.h"
+#include "openthread/logging.h"
 #include "esp_ot_ota_commands.h"
 #include "esp_ota_ops.h"
 #include "esp_rcp_firmware.h"
@@ -2818,7 +2819,7 @@ static esp_err_t esp_otbr_config_get_handler(httpd_req_t *req)
     /* Read each well-known key; omit keys that have no stored value */
     static const char *const keys[] = {
         NVS_CONFIG_KEY_HOSTNAME,   NVS_CONFIG_KEY_WIFI_SSID, NVS_CONFIG_KEY_TH_TXPWR,
-        NVS_CONFIG_KEY_TH_LDR_WT,
+        NVS_CONFIG_KEY_TH_LDR_WT,  NVS_CONFIG_KEY_TH_LOG_LVL,
 #if CONFIG_NET_SYSLOG_ENABLED
         NVS_CONFIG_KEY_SYSLOG_SRV, NVS_CONFIG_KEY_SYSLOG_PORT,
 #endif
@@ -2830,6 +2831,21 @@ static esp_err_t esp_otbr_config_get_handler(httpd_req_t *req)
         } else {
             cJSON_AddNullToObject(cfg, keys[i]);
         }
+    }
+
+    /* Report the level OpenThread is really running at. NVS only records what was
+     * last requested, which says nothing after a factory reset or a firmware whose
+     * default differs. */
+    {
+        char level_str[4];
+        otLogLevel level;
+
+        esp_openthread_lock_acquire(portMAX_DELAY);
+        level = otLoggingGetLevel();
+        esp_openthread_lock_release();
+        snprintf(level_str, sizeof(level_str), "%d", (int)level);
+        cJSON_DeleteItemFromObject(cfg, NVS_CONFIG_KEY_TH_LOG_LVL);
+        cJSON_AddStringToObject(cfg, NVS_CONFIG_KEY_TH_LOG_LVL, level_str);
     }
 
     error = cJSON_CreateNumber((double)ESP_OK);
@@ -2906,6 +2922,24 @@ static esp_err_t esp_otbr_config_put_handler(httpd_req_t *req)
             otThreadSetLocalLeaderWeight(esp_openthread_get_instance(), ldrwt);
             esp_openthread_lock_release();
             any_set = true;
+        }
+    }
+
+    /* OpenThread log verbosity (OT_LOG_LEVEL_NONE..DEBG). Applied live; persisted so
+     * it survives a reboot, and re-applied from thread_event_handler on start. */
+    cJSON *otlog_j = cJSON_GetObjectItemCaseSensitive(request, NVS_CONFIG_KEY_TH_LOG_LVL);
+    if (cJSON_IsString(otlog_j) && otlog_j->valuestring && otlog_j->valuestring[0] != '\0') {
+        int level = atoi(otlog_j->valuestring);
+        if (level >= OT_LOG_LEVEL_NONE && level <= OT_LOG_LEVEL_DEBG) {
+            esp_openthread_lock_acquire(portMAX_DELAY);
+            otError err = otLoggingSetLevel((otLogLevel)level);
+            esp_openthread_lock_release();
+            if (err == OT_ERROR_NONE && nvs_config_set(NVS_CONFIG_KEY_TH_LOG_LVL, otlog_j->valuestring) == ESP_OK) {
+                ESP_LOGI(WEB_TAG, "OpenThread log level set to %d", level);
+                any_set = true;
+            } else {
+                ESP_LOGW(WEB_TAG, "Failed to set OpenThread log level %d (err %d)", level, err);
+            }
         }
     }
 
