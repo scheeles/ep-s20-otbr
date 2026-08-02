@@ -46,14 +46,45 @@ idf.py build
 First deployment must use a USB connection, subsequent updates can be pushed by network.
 If you're using WSL, check [Connect USB devices to WSL](https://learn.microsoft.com/en-us/windows/wsl/connect-usb)
 
-To erase the flash with a USB cable (recommended before flashing the firmware):
-```
-$ idf.py -p /dev/ttyUSB0 erase-flash
-```
 To flash the firmware with a USB cable:
 ```
 $ idf.py -p /dev/ttyUSB0 flash
 ```
+This leaves the `nvs` partition alone, so the Thread dataset and settings survive.
+
+To erase the flash completely (only needed when the partition layout changes, or to
+factory reset — this drops the Thread commissioning):
+```
+$ idf.py -p /dev/ttyUSB0 erase-flash
+```
+
+### Partition layout
+
+| partition | offset | size |
+| --- | --- | --- |
+| nvs | `0x9000` | 64 K |
+| otadata | `0x19000` | 8 K |
+| phy_init | `0x1B000` | 4 K |
+| ota_0 | `0x20000` | 4 M |
+| ota_1 | `0x420000` | 4 M |
+| web_storage | `0x820000` | 500 K |
+| rcp_fw | `0x89D000` | 640 K |
+
+**Never assume these offsets for a device in front of you.** OTA updates only replace
+partition *contents*, never the partition table, so a device that has been updated
+over the network keeps whatever layout it was originally flashed with. Writing an
+image at the wrong offset corrupts whichever partition actually lives there — a
+mangled `rcp_fw` shows up as `SPIFFS: mount failed` and a boot loop.
+
+The authoritative layout is the one the device prints on every boot:
+```
+$ idf.py -p /dev/ttyUSB0 monitor
+...
+I (37) boot: Partition Table:
+I (40) boot:  0 nvs              WiFi data        01 02 00009000 00010000
+...
+```
+Use those offsets when flashing individual binaries with `esptool write-flash`.
 To start log monitoring with a USB cable:
 ```
 $ idf.py -p /dev/ttyUSB0 monitor
