@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -37,6 +38,7 @@
 #include "esp_timer.h"
 #include "esp_vfs.h"
 #include "http_parser.h"
+#include "lwip/sockets.h"
 #include "protocol_examples_common.h"
 #if CONFIG_NET_SYSLOG_ENABLED
 #include "net_syslog.h"
@@ -68,6 +70,9 @@
 #define LOG_QUERY_VALUE_LEN 32
 #define LOG_SSE_POLL_MS 250
 #define LOG_SSE_KEEPALIVE_MS 3000
+/* Backstop for a peer that neither reads nor closes: end the response and let the
+ * browser reconnect (see the "retry:" field and Last-Event-ID handling below). */
+#define LOG_SSE_MAX_STREAM_MS 30000
 #define OTA_TASK_STACK_SIZE 6144
 #define OTA_TASK_PRIORITY 5
 #define OTA_RESTART_TASK_STACK_SIZE 2048
@@ -1906,12 +1911,43 @@ exit:
     return ret;
 }
 
+/*
+ * Report whether the SSE peer has gone away.
+ *
+ * esp_http_server runs every request on one task, so a streaming handler blocks
+ * the whole server until it returns. It otherwise only learns that the client
+ * vanished when a send fails, and on a half-closed socket that can take a very
+ * long time — long enough that a single closed browser tab leaves the web UI
+ * unreachable. Peeking costs nothing and turns an orderly FIN into an immediate
+ * exit.
+ */
+static bool sse_peer_disconnected(httpd_req_t *req)
+{
+    int sockfd = httpd_req_to_sockfd(req);
+    char probe;
+    int ret;
+
+    if (sockfd < 0) {
+        return true;
+    }
+
+    ret = recv(sockfd, &probe, sizeof(probe), MSG_PEEK | MSG_DONTWAIT);
+    if (ret == 0) {
+        return true; /* orderly shutdown by the peer */
+    }
+    if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        return true; /* socket is gone or unusable */
+    }
+    return false; /* no data, or an unread request body: still connected */
+}
+
 static esp_err_t esp_otbr_logs_stream_get_handler(httpd_req_t *req)
 {
     esp_err_t ret = ESP_OK;
     bool client_closed = false;
     uint64_t cursor = parse_log_cursor(req);
     TickType_t last_keepalive = xTaskGetTickCount();
+    TickType_t stream_started = last_keepalive;
 
     ESP_GOTO_ON_ERROR(httpd_resp_set_type(req, "text/event-stream"), exit, WEB_TAG, "Failed to set SSE content type");
     ESP_GOTO_ON_ERROR(httpd_resp_set_hdr(req, "Cache-Control", "no-store"), exit, WEB_TAG,
@@ -1927,6 +1963,18 @@ static esp_err_t esp_otbr_logs_stream_get_handler(httpd_req_t *req)
         size_t log_len = 0;
         uint64_t next_cursor = cursor;
         bool truncated = false;
+
+        if (sse_peer_disconnected(req)) {
+            client_closed = true;
+            goto exit;
+        }
+
+        /* Hand the server back periodically. The client reconnects on its own and
+         * resumes from Last-Event-ID, so this costs nothing but stops one viewer
+         * from owning the only request task indefinitely. */
+        if ((xTaskGetTickCount() - stream_started) >= pdMS_TO_TICKS(LOG_SSE_MAX_STREAM_MS)) {
+            goto exit;
+        }
 
         ret = copy_log_buffer_since(cursor, &log_text, &log_len, &next_cursor, &truncated);
         if (ret != ESP_OK) {
