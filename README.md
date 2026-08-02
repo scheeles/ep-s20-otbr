@@ -188,6 +188,45 @@ $ nc -u -l -p 514
 $ tcpdump -nAi any udp port 514
 ```
 
+## OpenThread log level
+
+The Thread stack's verbosity is adjustable at runtime under **Mesh → Advanced
+Management → OpenThread Log Level**, from `None` through `Debug`. The setting is
+applied immediately, stored in NVS and re-applied on every boot — no rebuild, no
+reflash.
+
+Combined with remote syslog, this is the practical way to debug a mesh problem on a
+deployed device: raise the level, reproduce, read the result in Loki, put it back.
+
+| Level | Value |
+| --- | --- |
+| None | 0 |
+| Critical | 1 |
+| Warning | 2 |
+| Note | 3 |
+| Info | 4 |
+| Debug | 5 |
+
+Also available over the API:
+
+```
+$ curl http://<device>/config                                   # reports the live level
+$ curl -X PUT http://<device>/config -d '{"th_log_lvl":"5"}'    # Debug
+```
+
+`GET /config` reports the level OpenThread is *actually* running at rather than the
+stored value, so it stays accurate after a factory reset.
+
+**`Debug` is genuinely verbose.** On a busy mesh it can outpace the syslog queue,
+which drops lines rather than blocking (by design), and the extra work is not free on
+a border router that is also routing. Raise it to reproduce something, then put it
+back to `Info`.
+
+This relies on `CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC` (on by default) and on
+`CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y` in `sdkconfig.defaults` — OpenThread's platform
+logger checks the compile-time `LOG_LOCAL_LEVEL`, so without that the `Debug`
+selection would apply but print nothing.
+
 ## Integrating with Home Assistant
 
 See [Home Assistant](docs/homeassistant.md).
