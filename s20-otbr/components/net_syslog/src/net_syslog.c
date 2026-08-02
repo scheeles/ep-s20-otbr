@@ -35,6 +35,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -77,12 +78,12 @@ static bool s_started = false;
  * queue nobody is draining. */
 static QueueHandle_t volatile s_queue = NULL;
 
-/* Destination double buffer. net_syslog_set_server() fills the spare slot and
- * then publishes it with a single write to s_dest_idx, so the worker either
- * sees the whole old address or the whole new one — never a half-written one —
- * without taking a lock. */
-static struct sockaddr_in s_dest[2];
-static volatile uint8_t s_dest_idx = 0;
+/* The destination has exactly one reader — the worker task — and it is allowed
+ * to block, so a plain mutex is enough to keep a reconfigure from being seen
+ * half-applied. Nothing on the logging path touches it: the hook only reads the
+ * s_dest_valid flag, so no logging task can ever wait on this lock. */
+static struct sockaddr_in s_dest;
+static SemaphoreHandle_t s_dest_lock = NULL;
 static volatile bool s_dest_valid = false;
 
 /* Set while the worker is inside sendto(). If anything under lwip logs, that
@@ -162,14 +163,17 @@ static void net_syslog_send_line(int sock, const char *line)
 {
     char pkt[SYSLOG_PKT_MAX];
     char timestamp[SYSLOG_TIMESTAMP_MAX];
-    const struct sockaddr_in *dest;
+    struct sockaddr_in dest;
     struct tm utc;
     time_t now;
     size_t len;
     int written;
 
-    /* Read the published slot index exactly once. */
-    dest = &s_dest[s_dest_idx & 1];
+    /* Take a private copy so a reconfigure cannot change the address midway
+     * through building and sending this packet. */
+    xSemaphoreTake(s_dest_lock, portMAX_DELAY);
+    dest = s_dest;
+    xSemaphoreGive(s_dest_lock);
 
     now = time(NULL);
     if (gmtime_r(&now, &utc) == NULL || strftime(timestamp, sizeof(timestamp), "%b %e %H:%M:%S", &utc) == 0) {
@@ -185,7 +189,7 @@ static void net_syslog_send_line(int sock, const char *line)
 
     /* Guard the window in which lwip could log back at us. */
     s_sending_task = xTaskGetCurrentTaskHandle();
-    (void)sendto(sock, pkt, len, MSG_DONTWAIT, (const struct sockaddr *)dest, sizeof(*dest));
+    (void)sendto(sock, pkt, len, MSG_DONTWAIT, (const struct sockaddr *)&dest, sizeof(dest));
     s_sending_task = NULL;
 }
 
@@ -219,6 +223,15 @@ static bool net_syslog_worker_ensure(void)
 
     if (s_queue != NULL) {
         return true;
+    }
+
+    /* Created before the worker exists, so the worker never races it. */
+    if (s_dest_lock == NULL) {
+        s_dest_lock = xSemaphoreCreateMutex();
+        if (s_dest_lock == NULL) {
+            ESP_LOGW(TAG, "Failed to allocate the syslog lock, remote logging disabled");
+            return false;
+        }
     }
 
     queue = xQueueCreate(SYSLOG_QUEUE_DEPTH, SYSLOG_LINE_MAX);
@@ -299,7 +312,6 @@ static int net_syslog_vprintf(const char *fmt, va_list args)
 esp_err_t net_syslog_set_server(const char *server_ip, uint16_t port)
 {
     struct sockaddr_in dest;
-    uint8_t spare;
 
     if (server_ip == NULL || server_ip[0] == '\0' || port == 0) {
         /* Stop sending, but keep the socket and the worker in place so a server
@@ -321,10 +333,9 @@ esp_err_t net_syslog_set_server(const char *server_ip, uint16_t port)
         return ESP_ERR_NO_MEM;
     }
 
-    /* Fill the slot the worker is not reading, then publish it. */
-    spare = (uint8_t)((s_dest_idx & 1) ^ 1);
-    s_dest[spare] = dest;
-    s_dest_idx = spare;
+    xSemaphoreTake(s_dest_lock, portMAX_DELAY);
+    s_dest = dest;
+    xSemaphoreGive(s_dest_lock);
     s_dest_valid = true;
 
     ESP_LOGI(TAG, "Mirroring logs to syslog://%s:%u as '%s'", server_ip, (unsigned)port, s_hostname);

@@ -51,9 +51,9 @@ void net_syslog_start(const char *server_ip, uint16_t port, const char *hostname
  * @brief Point remote logging at a different server, or switch it off.
  *
  * Safe to call at any time, including before net_syslog_start() (the value is
- * remembered) and while other tasks are logging: the destination is published
- * to the worker without locking and without touching the socket, so no line can
- * ever observe a half-written address.
+ * remembered) and while other tasks are logging: the destination is only ever
+ * read by the worker task, under a lock no logging task touches, so a packet
+ * can never be sent to a half-applied address.
  *
  * The first call with a valid server also creates the queue and worker task, so
  * a device that never configures a server pays no RAM for them.
