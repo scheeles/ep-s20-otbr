@@ -1,0 +1,4 @@
+# Host-test build output
+test_net_syslog
+test_net_syslog_sanitize
+*.dSYM/
