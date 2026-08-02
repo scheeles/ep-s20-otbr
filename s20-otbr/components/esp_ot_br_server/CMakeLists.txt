@@ -1,4 +1,4 @@
-set(requires mdns fatfs spiffs esp_eth nvs_flash freertos openthread esp_http_server protocol_examples_common esp_wifi esp_app_format esp_timer esp_br_http_ota esp_ot_cli_extension esp_system mbedtls nvs_config net_syslog)
+set(requires mdns fatfs spiffs esp_eth nvs_flash freertos openthread esp_http_server protocol_examples_common esp_wifi esp_app_format esp_timer esp_br_http_ota esp_ot_cli_extension esp_system mbedtls nvs_config net_syslog lwip)
 
 # For IDF < 6.0, use IDF's built-in json component; for IDF >= 6.0 use managed cJSON component through idf_component.yml
 if("${IDF_VERSION_MAJOR}" VERSION_LESS "6")
