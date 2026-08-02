@@ -129,10 +129,26 @@ The component is started from the got-IP handler in
 races the netif. The call is idempotent, so DHCP renewals re-entering the handler
 will not undo a server configured from the UI.
 
-The log hook formats on the caller's stack (bounded buffers, no heap): a logging
-task needs roughly 1.1 kB of headroom. Shrink `SYSLOG_MSG_MAX` / `SYSLOG_PKT_MAX` in
-[`components/net_syslog/src/net_syslog.c`](s20-otbr/components/net_syslog/src/net_syslog.c)
-if a task with a tight stack has to log.
+**The log hook never calls into lwip.** It formats the line and drops it into a
+fixed-size queue; a dedicated worker task owns the socket and sends the packet. This
+is not an optimisation — the hook runs on whichever task logged, *including lwip's
+own tcpip thread*, and with `LWIP_TCPIP_CORE_LOCKING` disabled (the ESP-IDF default)
+a socket call from that thread waits on a semaphore only that thread can signal:
+an unrecoverable deadlock of the whole network stack. A non-blocking socket does not
+help, because `O_NONBLOCK`/`MSG_DONTWAIT` only govern what lwip does *after* the
+tcpip thread picks the message up.
+
+Costs of that split:
+
+| | |
+| --- | --- |
+| Stack borrowed from a logging task | ~370 B (one `SYSLOG_LINE_MAX` buffer) |
+| Queue | 16 × 256 B = 4 kB |
+| Worker task stack | 3.5 kB |
+
+The queue and worker are created on the **first** successful server configuration, so
+a device that never enables remote logging pays nothing. A full queue drops lines
+rather than delaying the caller, so a burst costs log lines, never latency.
 
 To verify on the receiving host:
 
