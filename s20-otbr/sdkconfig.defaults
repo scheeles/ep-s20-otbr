@@ -75,6 +75,13 @@ CONFIG_OPENTHREAD_CLI_OTA=y
 CONFIG_OPENTHREAD_RCP_COMMAND=y
 CONFIG_AUTO_UPDATE_RCP=y
 
+# Logging
+# OpenThread's platform logger (otPlatLog) gates each level on the compile-time
+# LOG_LOCAL_LEVEL, so DEBUG must be retained in the image for the runtime log-level
+# control to be able to reach OT_LOG_LEVEL_DEBG. Nothing extra is printed until the
+# level is actually raised.
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
 # mDNS
 CONFIG_MDNS_MAX_SERVICES=200
 
