@@ -17,6 +17,21 @@
             upload the images directly from your computer.</p>
 
         <div class="card section">
+            <div class="card-header">Update Source</div>
+            <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px">
+                GitHub repository checked for new releases, as <code>owner/repo</code>. Leave empty to restore the
+                built-in default. Point this at whichever fork actually publishes the firmware these devices run.
+            </p>
+            <div class="flex-between" style="gap:10px;flex-wrap:wrap">
+                <input class="form-input" type="text" id="updRepoInput" placeholder="owner/repo"
+                    style="max-width:320px;flex:1" maxlength="63">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-primary btn-sm" id="updRepoSaveBtn" onclick="saveUpdateRepo()">Save</button>
+                    <span id="updRepoStatus" style="font-size:13px"></span>
+                </div>
+            </div>
+        </div>
+        <div class="card section">
             <div class="card-header">Remote Update</div>
             <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px">
                 Enter the base URL of a release that contains <strong>s20_otbr.bin</strong>,
@@ -107,6 +122,42 @@
 
     <script src="/static/api.js"></script>
     <script>
+        function loadUpdateRepo() {
+            apiGet('/config').then(function (data) {
+                var repo = (data && data.result) ? data.result.upd_repo : null;
+                if (repo) {
+                    document.getElementById('updRepoInput').value = repo;
+                }
+            }).catch(function () { /* ignore — placeholder stays */ });
+        }
+
+        function saveUpdateRepo() {
+            var input = document.getElementById('updRepoInput');
+            var status = document.getElementById('updRepoStatus');
+            var btn = document.getElementById('updRepoSaveBtn');
+            var val = input.value.trim();
+            if (val && !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(val)) {
+                status.textContent = 'Expected owner/repo';
+                status.style.color = 'var(--danger)';
+                return;
+            }
+            btn.disabled = true;
+            status.textContent = 'Saving...';
+            status.style.color = 'var(--text-muted)';
+            apiPut('/config', { upd_repo: val }).then(function () {
+                status.textContent = val ? 'Saved' : 'Reset to default';
+                status.style.color = 'var(--success)';
+                loadUpdateRepo();
+            }).catch(function () {
+                status.textContent = 'Failed to save';
+                status.style.color = 'var(--danger)';
+            }).then(function () {
+                btn.disabled = false;
+            });
+        }
+
+        loadUpdateRepo();
+
         function renderOtaResult(title, message, isError) {
             var card = document.getElementById('otaResultCard');
             var body = document.getElementById('otaResultBody');

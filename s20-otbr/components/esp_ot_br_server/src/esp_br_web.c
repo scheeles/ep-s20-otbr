@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <ctype.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -92,10 +93,10 @@
  * github.com/<owner>/<repo>/releases/latest issues a 302 redirect to
  * .../releases/tag/<tag>, so the latest tag can be read straight from the
  * Location header - no API token, User-Agent or JSON parsing required. */
-#define UPDATE_CHECK_REPO "epinci/ep-s20-otbr"
-#define UPDATE_CHECK_LATEST_URL "https://github.com/" UPDATE_CHECK_REPO "/releases/latest"
-#define UPDATE_CHECK_RELEASE_TAG_URL "https://github.com/" UPDATE_CHECK_REPO "/releases/tag/"
-#define UPDATE_CHECK_DOWNLOAD_URL "https://github.com/" UPDATE_CHECK_REPO "/releases/download/"
+/* Repository the update check queries, as "owner/repo". Settable at runtime from
+ * the OTA page; CONFIG_OTA_UPDATE_CHECK_REPO is only the factory default. */
+#define UPDATE_CHECK_REPO_MAX 64
+#define UPDATE_CHECK_URL_MAX 192
 #define UPDATE_CHECK_TAG_MARKER "/releases/tag/"
 #define UPDATE_CHECK_TAG_MAX_LEN 64
 #define UPDATE_CHECK_HTTP_TIMEOUT_MS 10000
@@ -2115,28 +2116,81 @@ static esp_err_t update_http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+/*
+ * Accept only a plain "owner/repo": letters, digits, '.', '_', '-' and exactly one
+ * slash. The value is pasted straight into a URL the device then fetches over TLS,
+ * so anything looser would let a stray character redirect the update check.
+ */
+static bool update_repo_valid(const char *repo)
+{
+    size_t slashes = 0;
+    size_t len = 0;
+
+    if (repo == NULL || repo[0] == '\0' || repo[0] == '/') {
+        return false;
+    }
+    for (const char *c = repo; *c != '\0'; ++c, ++len) {
+        if (len >= UPDATE_CHECK_REPO_MAX - 1) {
+            return false;
+        }
+        if (*c == '/') {
+            slashes++;
+            continue;
+        }
+        if (!(isalnum((unsigned char)*c) || *c == '.' || *c == '_' || *c == '-')) {
+            return false;
+        }
+    }
+    return slashes == 1 && repo[len - 1] != '/';
+}
+
+/* Current repository: NVS if set and sane, otherwise the compile-time default. */
+static void update_repo_get(char *out, size_t out_len)
+{
+    char stored[UPDATE_CHECK_REPO_MAX];
+
+    if (nvs_config_get(NVS_CONFIG_KEY_UPD_REPO, stored, sizeof(stored)) == ESP_OK && update_repo_valid(stored)) {
+        snprintf(out, out_len, "%s", stored);
+        return;
+    }
+    snprintf(out, out_len, "%s", CONFIG_OTA_UPDATE_CHECK_REPO);
+}
+
+/* Compose "https://github.com/<repo><suffix>". */
+static void update_url_build(char *out, size_t out_len, const char *suffix)
+{
+    char repo[UPDATE_CHECK_REPO_MAX];
+
+    update_repo_get(repo, sizeof(repo));
+    snprintf(out, out_len, "https://github.com/%s%s", repo, suffix);
+}
+
 static esp_err_t update_fetch_latest_tag(char *tag_out, size_t tag_size)
 {
     esp_err_t ret = ESP_OK;
     const char *marker = NULL;
     int status_code = 0;
     char location[256] = {0};
+    char latest_url[UPDATE_CHECK_URL_MAX];
     update_location_ctx_t loc_ctx = {.buf = location, .size = sizeof(location), .found = false};
     esp_http_client_config_t config = {
-        .url = UPDATE_CHECK_LATEST_URL,
+        .url = latest_url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = UPDATE_CHECK_HTTP_TIMEOUT_MS,
         .disable_auto_redirect = true,
         .event_handler = update_http_event_handler,
         .user_data = &loc_ctx,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_handle_t client;
+
+    update_url_build(latest_url, sizeof(latest_url), "/releases/latest");
+    client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client, ESP_FAIL, WEB_TAG, "Failed to init update-check client");
 
-    ESP_GOTO_ON_ERROR(esp_http_client_open(client, 0), cleanup, WEB_TAG, "Failed to open %s", UPDATE_CHECK_LATEST_URL);
+    ESP_GOTO_ON_ERROR(esp_http_client_open(client, 0), cleanup, WEB_TAG, "Failed to open %s", latest_url);
     if (esp_http_client_fetch_headers(client) < 0) {
         ret = ESP_FAIL;
-        ESP_LOGE(WEB_TAG, "Failed to fetch headers from %s", UPDATE_CHECK_LATEST_URL);
+        ESP_LOGE(WEB_TAG, "Failed to fetch headers from %s", latest_url);
         goto cleanup;
     }
 
@@ -2174,7 +2228,10 @@ static void update_check_task(void *ctx)
 {
     char tag[UPDATE_CHECK_TAG_MAX_LEN] = {0};
 
-    ESP_LOGI(WEB_TAG, "Update check: querying %s", UPDATE_CHECK_LATEST_URL);
+    char latest_url[UPDATE_CHECK_URL_MAX];
+
+    update_url_build(latest_url, sizeof(latest_url), "/releases/latest");
+    ESP_LOGI(WEB_TAG, "Update check: querying %s", latest_url);
     esp_err_t err = update_fetch_latest_tag(tag, sizeof(tag));
 
     if (err == ESP_OK) {
@@ -2276,10 +2333,16 @@ static esp_err_t esp_otbr_ota_check_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(result, "current", current);
     cJSON_AddStringToObject(result, "latest", latest_tag);
     cJSON_AddBoolToObject(result, "update_available", update_available);
-    snprintf(url_buf, sizeof(url_buf), "%s%s/", UPDATE_CHECK_DOWNLOAD_URL, latest_tag);
-    cJSON_AddStringToObject(result, "download_base_url", url_buf);
-    snprintf(url_buf, sizeof(url_buf), "%s%s", UPDATE_CHECK_RELEASE_TAG_URL, latest_tag);
-    cJSON_AddStringToObject(result, "release_url", url_buf);
+    {
+        char base[UPDATE_CHECK_URL_MAX];
+
+        update_url_build(base, sizeof(base), "/releases/download/");
+        snprintf(url_buf, sizeof(url_buf), "%s%s/", base, latest_tag);
+        cJSON_AddStringToObject(result, "download_base_url", url_buf);
+        update_url_build(base, sizeof(base), UPDATE_CHECK_TAG_MARKER);
+        snprintf(url_buf, sizeof(url_buf), "%s%s", base, latest_tag);
+        cJSON_AddStringToObject(result, "release_url", url_buf);
+    }
 
     error = cJSON_CreateNumber((double)ESP_OK);
     message = cJSON_CreateString(update_available ? "A newer release is available." : "The device is up to date.");
@@ -2867,7 +2930,7 @@ static esp_err_t esp_otbr_config_get_handler(httpd_req_t *req)
     /* Read each well-known key; omit keys that have no stored value */
     static const char *const keys[] = {
         NVS_CONFIG_KEY_HOSTNAME,   NVS_CONFIG_KEY_WIFI_SSID, NVS_CONFIG_KEY_TH_TXPWR,
-        NVS_CONFIG_KEY_TH_LDR_WT,  NVS_CONFIG_KEY_TH_LOG_LVL,
+        NVS_CONFIG_KEY_TH_LDR_WT,  NVS_CONFIG_KEY_TH_LOG_LVL, NVS_CONFIG_KEY_UPD_REPO,
 #if CONFIG_NET_SYSLOG_ENABLED
         NVS_CONFIG_KEY_SYSLOG_SRV, NVS_CONFIG_KEY_SYSLOG_PORT,
 #endif
@@ -2894,6 +2957,16 @@ static esp_err_t esp_otbr_config_get_handler(httpd_req_t *req)
         snprintf(level_str, sizeof(level_str), "%d", (int)level);
         cJSON_DeleteItemFromObject(cfg, NVS_CONFIG_KEY_TH_LOG_LVL);
         cJSON_AddStringToObject(cfg, NVS_CONFIG_KEY_TH_LOG_LVL, level_str);
+    }
+
+    /* Report the repository actually in use, so the page shows the built-in default
+     * rather than a blank field when nothing was ever stored. */
+    {
+        char repo[UPDATE_CHECK_REPO_MAX];
+
+        update_repo_get(repo, sizeof(repo));
+        cJSON_DeleteItemFromObject(cfg, NVS_CONFIG_KEY_UPD_REPO);
+        cJSON_AddStringToObject(cfg, NVS_CONFIG_KEY_UPD_REPO, repo);
     }
 
     error = cJSON_CreateNumber((double)ESP_OK);
@@ -2970,6 +3043,25 @@ static esp_err_t esp_otbr_config_put_handler(httpd_req_t *req)
             otThreadSetLocalLeaderWeight(esp_openthread_get_instance(), ldrwt);
             esp_openthread_lock_release();
             any_set = true;
+        }
+    }
+
+    /* Update-check repository. An empty string clears the override and falls back to
+     * the compile-time default. */
+    cJSON *repo_j = cJSON_GetObjectItemCaseSensitive(request, NVS_CONFIG_KEY_UPD_REPO);
+    if (cJSON_IsString(repo_j) && repo_j->valuestring) {
+        if (repo_j->valuestring[0] == '\0') {
+            if (nvs_config_erase_key(NVS_CONFIG_KEY_UPD_REPO) == ESP_OK) {
+                ESP_LOGI(WEB_TAG, "Update-check repository reset to the built-in default");
+                any_set = true;
+            }
+        } else if (update_repo_valid(repo_j->valuestring)) {
+            if (nvs_config_set(NVS_CONFIG_KEY_UPD_REPO, repo_j->valuestring) == ESP_OK) {
+                ESP_LOGI(WEB_TAG, "Update-check repository set to %s", repo_j->valuestring);
+                any_set = true;
+            }
+        } else {
+            ESP_LOGW(WEB_TAG, "Rejected update-check repository '%s' (expected owner/repo)", repo_j->valuestring);
         }
     }
 
