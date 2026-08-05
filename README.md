@@ -227,6 +227,29 @@ This relies on `CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC` (on by default) and on
 logger checks the compile-time `LOG_LOCAL_LEVEL`, so without that the `Debug`
 selection would apply but print nothing.
 
+## Update source
+
+The device checks a GitHub repository for new releases and offers a one-click remote
+update. Which repository that is can be set under **OTA → Update Source** as
+`owner/repo`; leaving it empty restores the compile-time default
+(`CONFIG_OTA_UPDATE_CHECK_REPO`, `scheeles/ep-s20-otbr`).
+
+This matters on a fork. The repository is what the device compares its own version
+against, so a device pointed at someone else's releases will offer updates built from
+a different tree.
+
+```
+$ curl -X PUT http://<device>/config -d '{"upd_repo":"scheeles/ep-s20-otbr"}'
+$ curl -X PUT http://<device>/config -d '{"upd_repo":""}'    # back to the default
+```
+
+`GET /config` reports the repository actually in use, so the field shows the built-in
+default rather than a blank when nothing has been stored.
+
+Values are validated as a plain `owner/repo` — letters, digits, `.`, `_`, `-` and
+exactly one slash. The string is pasted into a URL the device then fetches, so
+anything looser would let a stray character point the update check somewhere else.
+
 ## Integrating with Home Assistant
 
 See [Home Assistant](docs/homeassistant.md).
