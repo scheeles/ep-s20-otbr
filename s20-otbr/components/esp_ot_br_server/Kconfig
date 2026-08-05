@@ -1,0 +1,14 @@
+menu "OTA update check"
+
+    config OTA_UPDATE_CHECK_REPO
+        string "GitHub repository to check for firmware releases"
+        default "scheeles/ep-s20-otbr"
+        help
+            Repository the device queries for new releases, as "owner/repo".
+
+            This is only the factory default: it can be changed at runtime from the
+            OTA page in the web UI, which stores it in NVS. Set it to whichever fork
+            actually publishes the firmware these devices run — a device pointed at a
+            repository someone else releases from will offer updates it should not.
+
+endmenu
