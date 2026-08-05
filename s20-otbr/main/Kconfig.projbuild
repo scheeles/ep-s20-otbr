@@ -12,8 +12,4 @@ menu "Firmware version Configuration"
         string "SDK Hash"
         default ""
 
-    config SW_VERSION
-        string "SW Version"
-        default ""
-
 endmenu
