@@ -15,6 +15,7 @@ extern "C" {
 #define NVS_CONFIG_KEY_TH_LDR_WT "th_ldr_wt"
 #define NVS_CONFIG_KEY_TH_TREL "th_trel"
 #define NVS_CONFIG_KEY_TH_LOG_LVL "th_log_lvl"
+#define NVS_CONFIG_KEY_UPD_REPO "upd_repo"
 #define NVS_CONFIG_KEY_SYSLOG_SRV "syslog_srv"
 #define NVS_CONFIG_KEY_SYSLOG_PORT "syslog_port"
 
