@@ -2,7 +2,14 @@
 
 # Configuration & Build
 CONFIG_IDF_VERSION=$(cat sdkconfig.defaults | grep CONFIG_SDK_VERSION | awk -F '"' '{print $2}')
-SW_VERSION=$(cat sdkconfig.defaults | grep CONFIG_SW_VERSION | awk -F '"' '{print $2}')
+# Derive the version from the tag, the same source ESP-IDF uses for PROJECT_VER
+# (see tools/cmake/project.cmake). A hand-maintained value in sdkconfig.defaults
+# only drifts: it sat at v0.2.0 for four releases.
+SW_VERSION=$(git describe --always --tags --dirty 2>/dev/null)
+if [ -z "$SW_VERSION" ]; then
+    echo "warning: 'git describe' failed, falling back to 0.0.0-unknown" >&2
+    SW_VERSION="0.0.0-unknown"
+fi
 
 echo "IDF_PATH=$IDF_PATH"
 echo "CONFIG_IDF_VERSION=$CONFIG_IDF_VERSION"
@@ -22,7 +29,7 @@ idf.py build
     rm -rf $TMP_OUTPUT_DIR
     mkdir -p $TMP_OUTPUT_DIR
 
-    fw_version=$(cat sdkconfig.defaults | grep CONFIG_SW_VERSION | awk -F '"' '{print $2}')
+    fw_version="$SW_VERSION"
 
     cp build/rcp_fw.bin $TMP_OUTPUT_DIR/s20-ot-rcp-fw-$fw_version.bin
     cp build/ota_data_initial.bin $TMP_OUTPUT_DIR/s20-ot-ota-data-initial-$fw_version.bin
