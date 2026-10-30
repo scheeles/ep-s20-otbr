@@ -12,76 +12,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Reuses the same build definition as PR CI, so a green PR is real evidence
+  # that the release will build. verify_tag additionally fails the build if the
+  # firmware would not report the release tag as its version.
   build:
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-
-    container:
-      image: espressif/idf:v6.1
-
-    env:
-      IDF_PATH: /opt/esp/idf
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v7
-        with:
-          #submodules: "recursive"
-          fetch-depth: 1
-          fetch-tags: true
-
-      - name: Prep repo for building
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git config --global --add safe.directory "$IDF_PATH"
-          git submodule update --init --recursive esp-thread-br
-
-      - name: Apply ESP-IDF patches
-        shell: bash
-        run: |
-          shopt -s nullglob
-          patches=("$GITHUB_WORKSPACE"/*.patch)
-          for patch in "${patches[@]}"; do
-            echo "Applying $(basename "$patch")"
-            git -C "$IDF_PATH" apply "$patch"
-          done
-
-      - name: Build OpenThread RCP Firmware
-        run: |
-          . $IDF_PATH/export.sh
-          cd $IDF_PATH/examples/openthread/ot_rcp
-          idf.py set-target esp32h2
-          idf.py build
-
-      - name: Build Main S20-OTBR Application
-        run: |
-          . $IDF_PATH/export.sh
-          cd s20-otbr
-          idf.py build
-
-      - name: Combine binaries
-        run: |
-          . $IDF_PATH/export.sh
-          cd s20-otbr/build
-          python -m esptool \
-            --chip esp32s3 \
-            merge_bin \
-            -o combined.bin \
-            "@flash_args"
-
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: esp32s3-otbr-firmware
-          path: |
-            s20-otbr/build/ota_with_rcp_image
-            s20-otbr/build/combined.bin
-            s20-otbr/build/s20_otbr.bin
-            s20-otbr/build/web_storage.bin
-            s20-otbr/build/rcp_fw.bin
-          if-no-files-found: error
+    uses: ./.github/workflows/build.yml
+    with:
+      verify_tag: ${{ github.event.release.tag_name || github.ref_name }}
 
   release:
     needs: build

@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -32,6 +33,7 @@
 #include "esp_openthread_border_router.h"
 #include "esp_openthread_lock.h"
 #include "esp_openthread_netif_glue.h"
+#include "openthread/logging.h"
 #include "esp_ot_ota_commands.h"
 #include "esp_ota_ops.h"
 #include "esp_rcp_firmware.h"
@@ -42,7 +44,11 @@
 #include "esp_vfs.h"
 #include "http_parser.h"
 #include "mdns.h"
+#include "lwip/sockets.h"
 #include "protocol_examples_common.h"
+#if CONFIG_NET_SYSLOG_ENABLED
+#include "net_syslog.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -68,6 +74,9 @@
 #define LOG_QUERY_VALUE_LEN 32
 #define LOG_SSE_POLL_MS 250
 #define LOG_SSE_KEEPALIVE_MS 3000
+/* Backstop for a peer that neither reads nor closes: end the response and let the
+ * browser reconnect (see the "retry:" field and Last-Event-ID handling below). */
+#define LOG_SSE_MAX_STREAM_MS 30000
 #define OTA_TASK_STACK_SIZE 6144
 #define OTA_TASK_PRIORITY 5
 #define OTA_RESTART_TASK_STACK_SIZE 2048
@@ -2086,12 +2095,43 @@ exit:
     return ret;
 }
 
+/*
+ * Report whether the SSE peer has gone away.
+ *
+ * esp_http_server runs every request on one task, so a streaming handler blocks
+ * the whole server until it returns. It otherwise only learns that the client
+ * vanished when a send fails, and on a half-closed socket that can take a very
+ * long time — long enough that a single closed browser tab leaves the web UI
+ * unreachable. Peeking costs nothing and turns an orderly FIN into an immediate
+ * exit.
+ */
+static bool sse_peer_disconnected(httpd_req_t *req)
+{
+    int sockfd = httpd_req_to_sockfd(req);
+    char probe;
+    int ret;
+
+    if (sockfd < 0) {
+        return true;
+    }
+
+    ret = recv(sockfd, &probe, sizeof(probe), MSG_PEEK | MSG_DONTWAIT);
+    if (ret == 0) {
+        return true; /* orderly shutdown by the peer */
+    }
+    if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        return true; /* socket is gone or unusable */
+    }
+    return false; /* no data, or an unread request body: still connected */
+}
+
 static esp_err_t esp_otbr_logs_stream_get_handler(httpd_req_t *req)
 {
     esp_err_t ret = ESP_OK;
     bool client_closed = false;
     uint64_t cursor = parse_log_cursor(req);
     TickType_t last_keepalive = xTaskGetTickCount();
+    TickType_t stream_started = last_keepalive;
 
     ESP_GOTO_ON_ERROR(httpd_resp_set_type(req, "text/event-stream"), exit, WEB_TAG, "Failed to set SSE content type");
     ESP_GOTO_ON_ERROR(httpd_resp_set_hdr(req, "Cache-Control", "no-store"), exit, WEB_TAG,
@@ -2107,6 +2147,18 @@ static esp_err_t esp_otbr_logs_stream_get_handler(httpd_req_t *req)
         size_t log_len = 0;
         uint64_t next_cursor = cursor;
         bool truncated = false;
+
+        if (sse_peer_disconnected(req)) {
+            client_closed = true;
+            goto exit;
+        }
+
+        /* Hand the server back periodically. The client reconnects on its own and
+         * resumes from Last-Event-ID, so this costs nothing but stops one viewer
+         * from owning the only request task indefinitely. */
+        if ((xTaskGetTickCount() - stream_started) >= pdMS_TO_TICKS(LOG_SSE_MAX_STREAM_MS)) {
+            goto exit;
+        }
 
         ret = copy_log_buffer_since(cursor, &log_text, &log_len, &next_cursor, &truncated);
         if (ret != ESP_OK) {
@@ -2997,7 +3049,12 @@ static esp_err_t esp_otbr_config_get_handler(httpd_req_t *req)
 
     /* Read each well-known key; omit keys that have no stored value */
     static const char *const keys[] = {
-        NVS_CONFIG_KEY_HOSTNAME, NVS_CONFIG_KEY_WIFI_SSID, NVS_CONFIG_KEY_TH_TXPWR, NVS_CONFIG_KEY_TH_LDR_WT, NULL,
+        NVS_CONFIG_KEY_HOSTNAME,   NVS_CONFIG_KEY_WIFI_SSID, NVS_CONFIG_KEY_TH_TXPWR,
+        NVS_CONFIG_KEY_TH_LDR_WT,  NVS_CONFIG_KEY_TH_LOG_LVL,
+#if CONFIG_NET_SYSLOG_ENABLED
+        NVS_CONFIG_KEY_SYSLOG_SRV, NVS_CONFIG_KEY_SYSLOG_PORT,
+#endif
+        NULL,
     };
     for (int i = 0; keys[i] != NULL; i++) {
         if (nvs_config_get(keys[i], buf, sizeof(buf)) == ESP_OK) {
@@ -3005,6 +3062,21 @@ static esp_err_t esp_otbr_config_get_handler(httpd_req_t *req)
         } else {
             cJSON_AddNullToObject(cfg, keys[i]);
         }
+    }
+
+    /* Report the level OpenThread is really running at. NVS only records what was
+     * last requested, which says nothing after a factory reset or a firmware whose
+     * default differs. */
+    {
+        char level_str[4];
+        otLogLevel level;
+
+        esp_openthread_lock_acquire(portMAX_DELAY);
+        level = otLoggingGetLevel();
+        esp_openthread_lock_release();
+        snprintf(level_str, sizeof(level_str), "%d", (int)level);
+        cJSON_DeleteItemFromObject(cfg, NVS_CONFIG_KEY_TH_LOG_LVL);
+        cJSON_AddStringToObject(cfg, NVS_CONFIG_KEY_TH_LOG_LVL, level_str);
     }
 
     error = cJSON_CreateNumber((double)ESP_OK);
@@ -3083,6 +3155,67 @@ static esp_err_t esp_otbr_config_put_handler(httpd_req_t *req)
             any_set = true;
         }
     }
+
+    /* OpenThread log verbosity (OT_LOG_LEVEL_NONE..DEBG). Applied live; persisted so
+     * it survives a reboot, and re-applied from thread_event_handler on start. */
+    cJSON *otlog_j = cJSON_GetObjectItemCaseSensitive(request, NVS_CONFIG_KEY_TH_LOG_LVL);
+    if (cJSON_IsString(otlog_j) && otlog_j->valuestring && otlog_j->valuestring[0] != '\0') {
+        int level = atoi(otlog_j->valuestring);
+        if (level >= OT_LOG_LEVEL_NONE && level <= OT_LOG_LEVEL_DEBG) {
+            esp_openthread_lock_acquire(portMAX_DELAY);
+            otError err = otLoggingSetLevel((otLogLevel)level);
+            esp_openthread_lock_release();
+            if (err == OT_ERROR_NONE && nvs_config_set(NVS_CONFIG_KEY_TH_LOG_LVL, otlog_j->valuestring) == ESP_OK) {
+                ESP_LOGI(WEB_TAG, "OpenThread log level set to %d", level);
+                any_set = true;
+            } else {
+                ESP_LOGW(WEB_TAG, "Failed to set OpenThread log level %d (err %d)", level, err);
+            }
+        }
+    }
+
+#if CONFIG_NET_SYSLOG_ENABLED
+    /* Remote syslog endpoint. An empty server string is meaningful: it switches
+     * remote logging off. Both keys are persisted first, then the effective
+     * pair is applied to the running log hook, so a change takes effect
+     * immediately without a reboot. */
+    bool syslog_changed = false;
+
+    cJSON *slsrv_j = cJSON_GetObjectItemCaseSensitive(request, NVS_CONFIG_KEY_SYSLOG_SRV);
+    if (cJSON_IsString(slsrv_j) && slsrv_j->valuestring) {
+        if (nvs_config_set(NVS_CONFIG_KEY_SYSLOG_SRV, slsrv_j->valuestring) == ESP_OK) {
+            syslog_changed = true;
+            any_set = true;
+        }
+    }
+
+    cJSON *slport_j = cJSON_GetObjectItemCaseSensitive(request, NVS_CONFIG_KEY_SYSLOG_PORT);
+    if (cJSON_IsString(slport_j) && slport_j->valuestring && slport_j->valuestring[0] != '\0') {
+        int port = atoi(slport_j->valuestring);
+        if (port > 0 && port <= UINT16_MAX &&
+            nvs_config_set(NVS_CONFIG_KEY_SYSLOG_PORT, slport_j->valuestring) == ESP_OK) {
+            syslog_changed = true;
+            any_set = true;
+        }
+    }
+
+    if (syslog_changed) {
+        char syslog_srv[64];
+        char syslog_port[8];
+        uint16_t port = CONFIG_NET_SYSLOG_SERVER_PORT;
+
+        if (nvs_config_get(NVS_CONFIG_KEY_SYSLOG_SRV, syslog_srv, sizeof(syslog_srv)) != ESP_OK) {
+            syslog_srv[0] = '\0';
+        }
+        if (nvs_config_get(NVS_CONFIG_KEY_SYSLOG_PORT, syslog_port, sizeof(syslog_port)) == ESP_OK) {
+            int stored = atoi(syslog_port);
+            if (stored > 0 && stored <= UINT16_MAX) {
+                port = (uint16_t)stored;
+            }
+        }
+        net_syslog_set_server(syslog_srv, port);
+    }
+#endif /* CONFIG_NET_SYSLOG_ENABLED */
 
     if (any_set) {
         error = cJSON_CreateNumber((double)ESP_OK);

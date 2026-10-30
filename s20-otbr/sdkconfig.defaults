@@ -79,8 +79,19 @@ CONFIG_AUTO_UPDATE_RCP=y
 CONFIG_DEFAULT_PIN_TO_RCP_RESET=7
 CONFIG_DEFAULT_PIN_TO_RCP_BOOT=8
 
+# Logging
+# OpenThread's platform logger (otPlatLog) gates each level on the compile-time
+# LOG_LOCAL_LEVEL, so DEBUG must be retained in the image for the runtime log-level
+# control to be able to reach OT_LOG_LEVEL_DEBG. Nothing extra is printed until the
+# level is actually raised.
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
 # mDNS
 CONFIG_MDNS_MAX_SERVICES=200
+
+# Remote logging
+# Compiled in but dormant: set the syslog server from the web UI (Network page).
+CONFIG_NET_SYSLOG_ENABLED=y
 
 # Versions
 CONFIG_SDK_VERSION="v6.0.2"
