@@ -1,0 +1,39 @@
+menu "Network syslog"
+
+    config NET_SYSLOG_ENABLED
+        bool "Mirror logs to a remote UDP syslog server"
+        default n
+        help
+            Mirror the ESP-IDF log stream to a remote RFC3164 UDP syslog server
+            (e.g. a Grafana Alloy loki.source.syslog listener). Purely additive:
+            UART/console logging is unaffected.
+
+            The server is normally set at runtime from the web UI (Network page)
+            and stored in NVS; the options below only provide the defaults used
+            when nothing is stored yet.
+
+    config NET_SYSLOG_SERVER_IP
+        string "Default syslog server IPv4 address"
+        depends on NET_SYSLOG_ENABLED
+        default ""
+        help
+            Fallback dotted-quad IPv4 address, used only when no server is
+            stored in NVS. Leave empty to ship dormant and configure the
+            server from the web UI. Hostnames are not resolved: remote
+            logging must not depend on DNS being up.
+
+    config NET_SYSLOG_SERVER_PORT
+        int "Default syslog server UDP port"
+        depends on NET_SYSLOG_ENABLED
+        range 1 65535
+        default 514
+
+    config NET_SYSLOG_HOSTNAME
+        string "Syslog HOSTNAME field"
+        depends on NET_SYSLOG_ENABLED
+        default "ep-s20-otbr"
+        help
+            Fallback value for the RFC3164 HOSTNAME field, used when no
+            hostname is stored in NVS. Spaces are replaced with underscores.
+
+endmenu
