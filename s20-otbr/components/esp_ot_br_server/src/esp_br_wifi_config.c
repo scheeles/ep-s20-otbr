@@ -29,6 +29,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
 #include "nvs.h"
 #include "nvs_config.h"
 #include "nvs_flash.h"
@@ -213,6 +214,20 @@ static esp_err_t wifi_config_start_softap(void)
     esp_err_t ret = ESP_OK;
     uint8_t mac[6];
 
+    // Initialize WiFi if not already initialized
+    // Setup configurations before obtaining wifi mac
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    ret = esp_wifi_get_mode(&mode);
+
+    if (ret == ESP_ERR_WIFI_NOT_INIT) {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ret = esp_wifi_init(&cfg);
+    }
+    ESP_RETURN_ON_ERROR(ret, WIFI_CONFIG_TAG, "Failed to initialize WiFi: %s", esp_err_to_name(ret));
+
+    // Get MAC address for SSID
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_AP, mac));
+
     // Create AP netif
     s_ap_netif = esp_netif_create_default_wifi_ap();
     ESP_RETURN_ON_FALSE(s_ap_netif != NULL, ESP_FAIL, WIFI_CONFIG_TAG, "Failed to create AP netif");
@@ -230,9 +245,6 @@ static esp_err_t wifi_config_start_softap(void)
     // Start DNS server
     wifi_config_dns_server_start();
 
-    // Get MAC address for SSID
-    ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
-
     // Generate SSID: ESP-ThreadBR-XXXX
     snprintf(s_softap_ssid, sizeof(s_softap_ssid), "ESP-ThreadBR-%02X%02X", mac[4], mac[5]);
 
@@ -244,12 +256,6 @@ static esp_err_t wifi_config_start_softap(void)
     wifi_config.ap.max_connection = 4;
     wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     wifi_config.ap.beacon_interval = 100; // Set beacon interval to 100ms for better discoverability
-
-    // Initialize WiFi if not already initialized
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ret = esp_wifi_init(&cfg);
-    ESP_RETURN_ON_FALSE(ret == ESP_OK || ret == ESP_ERR_INVALID_STATE, ret, WIFI_CONFIG_TAG,
-                        "Failed to initialize WiFi: %s", esp_err_to_name(ret));
 
     // Register event handlers
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_config_wifi_event_handler,
@@ -277,16 +283,12 @@ static void wifi_config_stop_softap(void)
         s_wifi_event_handler_instance = NULL;
     }
 
-    esp_wifi_stop();
+    ESP_ERROR_CHECK(esp_wifi_stop());
 
-    /* Always restore STA mode rather than calling esp_wifi_deinit(). If we deinit here, the
-     * managed component's s_wifi_initialized flag remains true, causing the next
-     * esp_ot_wifi_connect() to skip example_wifi_start() and fail with ESP_ERR_WIFI_NOT_INIT. */
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_deinit());
 
     if (s_ap_netif) {
-        esp_netif_destroy(s_ap_netif);
+        esp_netif_destroy_default_wifi(s_ap_netif);
         s_ap_netif = NULL;
     }
 
@@ -541,7 +543,7 @@ static esp_err_t wifi_config_start_webserver(void)
     httpd_register_uri_handler(s_wifi_config_server, &submit_uri);
 
     // Register icon handlers to avoid 404 warnings
-    const char *icon_urls[] = {"/favicon.ico", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
+    const char *icon_urls[] = {"/otbr.png", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
                                "/apple-touch-icon-120x120.png", "/apple-touch-icon-120x120-precomposed.png"};
 
     for (int i = 0; i < sizeof(icon_urls) / sizeof(icon_urls[0]); i++) {

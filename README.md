@@ -5,12 +5,12 @@ Luckily enough, they shared an [OpenSDK](https://github.com/gl-inet/s20_thread_b
 
 This is a minimalist, performance oriented firmare that supports:
 
-- [esp-idf](https://github.com/espressif/esp-idf) -> v6.0.2
+- [esp-idf](https://github.com/espressif/esp-idf) -> v6.1
     - Thread v1.4
     - TREL support
     - BBR support
     - Home Assistant OTBR integration
-- [esp-thread-br](https://github.com/espressif/esp-thread-br) -> main @ 25ab204
+- [esp-thread-br](https://github.com/espressif/esp-thread-br) -> main @ 29a2345
     - Used as base framework
     - Implemented only wired connectivity in order to keep the radio for Thread use only
     - Forked basic Web UI to add logs, remote/local OTA and more
@@ -62,13 +62,13 @@ $ idf.py -p /dev/ttyUSB0 erase-flash
 
 | partition | offset | size |
 | --- | --- | --- |
-| nvs | `0x9000` | 64 K |
-| otadata | `0x19000` | 8 K |
-| phy_init | `0x1B000` | 4 K |
-| ota_0 | `0x20000` | 4 M |
-| ota_1 | `0x420000` | 4 M |
-| web_storage | `0x820000` | 500 K |
-| rcp_fw | `0x89D000` | 640 K |
+| nvs | `0x9000` | 256 K |
+| otadata | `0x49000` | 8 K |
+| phy_init | `0x4B000` | 4 K |
+| ota_0 | `0x50000` | 4 M |
+| ota_1 | `0x450000` | 4 M |
+| web_storage | `0x850000` | 1 M |
+| rcp_fw | `0x950000` | 1 M |
 
 **Never assume these offsets for a device in front of you.** OTA updates only replace
 partition *contents*, never the partition table, so a device that has been updated

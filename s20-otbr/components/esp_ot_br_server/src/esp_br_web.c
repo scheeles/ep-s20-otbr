@@ -1,7 +1,9 @@
+#include <inttypes.h>
 #include <errno.h>
 #include <ctype.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,9 +29,11 @@
 #include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
 #include "esp_openthread_lock.h"
+#include "esp_openthread_netif_glue.h"
 #include "openthread/logging.h"
 #include "esp_ot_ota_commands.h"
 #include "esp_ota_ops.h"
@@ -40,6 +44,7 @@
 #include "esp_timer.h"
 #include "esp_vfs.h"
 #include "http_parser.h"
+#include "mdns.h"
 #include "lwip/sockets.h"
 #include "protocol_examples_common.h"
 #if CONFIG_NET_SYSLOG_ENABLED
@@ -49,7 +54,6 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#include "mdns.h"
 #include "nvs.h"
 #include "nvs_config.h"
 #include "nvs_flash.h"
@@ -66,7 +70,6 @@
 #define MAX_FILE_SIZE_STR "200KB"
 #define SCRATCH_BUFSIZE 1024 /* Scratch buffer size */
 #define VFS_PATH_MAXNUM 15
-#define SERVER_IPV4_LEN 16
 #define FILE_CHUNK_SIZE 4096
 #define LOG_BUFFER_SIZE (16 * 1024)
 #define LOG_QUERY_VALUE_LEN 32
@@ -105,8 +108,10 @@
 #define UPDATE_CHECK_TASK_PRIORITY 4
 #define WEB_TAG "obtr_web"
 
+ESP_EVENT_DEFINE_BASE(ESP_BR_WEB_EVENT);
+
 /*-----------------------------------------------------
- Note：Http Server
+Note: Http Server
 -----------------------------------------------------*/
 /**
  * @brief The basic configuration for http_server
@@ -120,13 +125,12 @@ typedef struct http_server_data {
  * @brief The basic information for http_server
  */
 typedef struct http_server {
-    httpd_handle_t handle;    /* server handle, unique */
-    http_server_data_t data;  /* data */
-    char ip[SERVER_IPV4_LEN]; /* ip */
-    uint16_t port;            /* port */
+    httpd_handle_t handle;   /* server handle, unique */
+    http_server_data_t data; /* data */
+    uint16_t port;           /* port */
 } http_server_t;
 
-static http_server_t s_server = {NULL, {"", ""}, "", 80}; /* the instance of server */
+static http_server_t s_server = {NULL, {"", ""}, 80}; /* the instance of server */
 
 static portMUX_TYPE s_log_buffer_lock = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t s_ota_mutex;
@@ -164,7 +168,7 @@ typedef struct request_url {
 } request_url_t;
 
 /*-----------------------------------------------------
- Note：Http Server Thread REST API
+Note: Http Server Thread REST API
 -----------------------------------------------------*/
 static esp_err_t esp_otbr_network_diagnostics_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_node_get_handler(httpd_req_t *req);
@@ -185,8 +189,20 @@ static esp_err_t esp_otbr_network_node_dataset_pending_handler(httpd_req_t *req)
 static esp_err_t esp_otbr_network_node_dataset_active_delete_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_node_dataset_pending_delete_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_node_dataset_handler(httpd_req_t *req, const char *dataset_type);
+static esp_err_t esp_otbr_network_node_epskc_state_get_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_node_epskc_state_put_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_node_epskc_key_get_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_node_epskc_key_post_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_node_epskc_key_delete_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_well_known_br_rest_get_handler(httpd_req_t *req);
 
 static httpd_uri_t s_resource_handlers[] = {
+    {
+        .uri = ESP_OT_REST_API_WELL_KNOWN_ESP_BR_REST_PATH,
+        .method = HTTP_GET,
+        .handler = esp_otbr_well_known_br_rest_get_handler,
+        .user_ctx = NULL,
+    },
     {
         .uri = ESP_OT_REST_API_DIAGNOSTICS_PATH,
         .method = HTTP_GET,
@@ -307,10 +323,40 @@ static httpd_uri_t s_resource_handlers[] = {
         .handler = esp_otbr_network_node_coprocessor_version_get_handler,
         .user_ctx = NULL,
     },
+    {
+        .uri = ESP_OT_REST_API_NODE_EPSKC_STATE_PATH,
+        .method = HTTP_GET,
+        .handler = esp_otbr_network_node_epskc_state_get_handler,
+        .user_ctx = NULL,
+    },
+    {
+        .uri = ESP_OT_REST_API_NODE_EPSKC_STATE_PATH,
+        .method = HTTP_PUT,
+        .handler = esp_otbr_network_node_epskc_state_put_handler,
+        .user_ctx = &s_server.data,
+    },
+    {
+        .uri = ESP_OT_REST_API_NODE_EPSKC_KEY_PATH,
+        .method = HTTP_GET,
+        .handler = esp_otbr_network_node_epskc_key_get_handler,
+        .user_ctx = NULL,
+    },
+    {
+        .uri = ESP_OT_REST_API_NODE_EPSKC_KEY_PATH,
+        .method = HTTP_POST,
+        .handler = esp_otbr_network_node_epskc_key_post_handler,
+        .user_ctx = &s_server.data,
+    },
+    {
+        .uri = ESP_OT_REST_API_NODE_EPSKC_KEY_PATH,
+        .method = HTTP_DELETE,
+        .handler = esp_otbr_network_node_epskc_key_delete_handler,
+        .user_ctx = NULL,
+    },
 };
 
 /*-----------------------------------------------------
- Note：Http Server WEB-GUI API
+Note: Http Server WEB-GUI API
 -----------------------------------------------------*/
 static esp_err_t esp_otbr_network_properties_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_available_networks_get_handler(httpd_req_t *req);
@@ -534,7 +580,7 @@ static httpd_uri_t s_web_gui_handlers[] = {
 };
 
 /*-----------------------------------------------------
- Note：Http Tools
+Note: Http Tools
 -----------------------------------------------------*/
 static cJSON *pack_response(cJSON *error, cJSON *result, cJSON *message)
 {
@@ -1350,7 +1396,7 @@ exit:
 }
 
 /*-----------------------------------------------------
- Note：Openthread resource API implement
+Note: Openthread resource API implement
 -----------------------------------------------------*/
 /**
  * @brief These APIs would collect corresponding information from Thread network and send to @param req.
@@ -1669,8 +1715,145 @@ exit:
     return ret;
 }
 
+static esp_err_t esp_otbr_network_node_epskc_state_get_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+    cJSON *response = handle_ot_resource_node_epskc_state_request();
+    ESP_GOTO_ON_ERROR(httpd_send_packet(req, response), exit, WEB_TAG, "Failed to response %s", req->uri);
+exit:
+    cJSON_Delete(response);
+    return ret;
+}
+
+static esp_err_t esp_otbr_network_node_epskc_state_put_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+    otError err = OT_ERROR_NONE;
+    cJSON *state = httpd_request_convert2_json(req, cJSON_Object);
+    if (cJSON_IsString(state)) {
+        err = handle_ot_resource_node_epskc_state_put_request(state);
+    } else {
+        ESP_LOGE(WEB_TAG, "Invalid args");
+        err = OT_ERROR_INVALID_ARGS;
+    }
+
+    char http_return_status[64];
+    if (convert_ot_err_to_response_code(err, http_return_status) != ESP_OK) {
+        strcpy(http_return_status, HTTPD_500);
+    }
+    httpd_resp_set_status(req, http_return_status);
+    ESP_GOTO_ON_ERROR(httpd_resp_send(req, NULL, 0), exit, WEB_TAG, "Failed to response %s", req->uri);
+exit:
+    cJSON_Delete(state);
+    return ret;
+}
+
+static esp_err_t esp_otbr_network_node_epskc_key_get_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+    cJSON *response = handle_ot_resource_node_epskc_key_get_request();
+    ESP_GOTO_ON_ERROR(httpd_send_packet(req, response), exit, WEB_TAG, "Failed to response %s", req->uri);
+exit:
+    cJSON_Delete(response);
+    return ret;
+}
+
+static esp_err_t esp_otbr_network_node_epskc_key_post_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+    cJSON *request = NULL;
+    cJSON *response = NULL;
+    cJSON *log = cJSON_CreateObject();
+    uint16_t errcode = 0;
+
+    if (req->content_len > 0) {
+        request = httpd_request_convert2_json(req, cJSON_Object);
+        if (!cJSON_IsObject(request)) {
+            errcode = 400;
+        }
+    }
+
+    if (errcode == 0) {
+        response = handle_ot_resource_node_epskc_key_post_request(request, log);
+        cJSON *value = cJSON_GetObjectItemCaseSensitive(log, "ErrorCode");
+        if (cJSON_IsNumber(value)) {
+            errcode = (uint16_t)cJSON_GetNumberValue(value);
+        }
+    }
+
+    char http_return_status[64];
+    ot_br_web_response_code_get(errcode, http_return_status);
+    httpd_resp_set_status(req, http_return_status);
+    if (response) {
+        ESP_GOTO_ON_ERROR(httpd_send_packet(req, response), exit, WEB_TAG, "Failed to response %s", req->uri);
+    } else {
+        ESP_GOTO_ON_ERROR(httpd_resp_send(req, NULL, 0), exit, WEB_TAG, "Failed to response %s", req->uri);
+    }
+exit:
+    cJSON_Delete(request);
+    cJSON_Delete(response);
+    cJSON_Delete(log);
+    return ret;
+}
+
+static esp_err_t esp_otbr_network_node_epskc_key_delete_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+    handle_ot_resource_node_epskc_key_delete_request();
+    httpd_resp_set_status(req, HTTPD_200);
+    ESP_GOTO_ON_ERROR(httpd_resp_send(req, NULL, 0), exit, WEB_TAG, "Failed to response %s", req->uri);
+exit:
+    return ret;
+}
+
+/**
+ * @brief REST API discovery endpoint (RFC 8615 well-known URI). Returns the REST API's version and
+ *        RFC 8288-style links to its entry points, so clients can discover them at runtime instead
+ *        of hardcoding or probing endpoint paths.
+ *
+ * @param[in] req The request from http client.
+ * @return
+ *      -   ESP_OK   : On success
+ *      -   ESP_FAIL : Failed to handle @param req
+ */
+static esp_err_t esp_otbr_well_known_br_rest_get_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+    cJSON *response = cJSON_CreateObject();
+    ESP_RETURN_ON_FALSE(response, ESP_FAIL, WEB_TAG, "Failed to allocate well-known response");
+
+    cJSON *api = cJSON_CreateObject();
+    ESP_GOTO_ON_FALSE(api, ESP_FAIL, exit, WEB_TAG, "Failed to allocate well-known api object");
+    cJSON_AddStringToObject(api, "version", ESP_OT_REST_API_VERSION);
+    cJSON_AddStringToObject(api, "base", "/");
+    cJSON_AddItemToObject(response, "api", api);
+
+    cJSON *links = cJSON_AddArrayToObject(response, "links");
+    static const struct {
+        const char *href;
+        const char *rel;
+    } entry_points[] = {
+        {ESP_OT_REST_API_WELL_KNOWN_ESP_BR_REST_PATH, "self"},
+        {ESP_OT_REST_API_NODE_PATH, "node"},
+        {ESP_OT_REST_API_DIAGNOSTICS_PATH, "diagnostic"},
+    };
+    for (size_t i = 0; i < sizeof(entry_points) / sizeof(entry_points[0]); i++) {
+        cJSON *link = cJSON_CreateObject();
+        cJSON_AddStringToObject(link, "href", entry_points[i].href);
+        cJSON_AddStringToObject(link, "rel", entry_points[i].rel);
+        cJSON *type = cJSON_AddArrayToObject(link, "type");
+        cJSON_AddItemToArray(type, cJSON_CreateString(ESP_OT_REST_CONTENT_TYPE_JSON));
+        cJSON_AddItemToArray(links, link);
+    }
+
+    ESP_GOTO_ON_ERROR(httpd_send_packet(req, response), exit, WEB_TAG, "Failed to response %s", req->uri);
+exit:
+    cJSON_Delete(response);
+    return ret;
+}
+
 /*-----------------------------------------------------
- Note：Openthread WEB GUI API implement
+Note: Openthread WEB GUI API implement
 -----------------------------------------------------*/
 /**
  * @brief The API would collect the properties of Thread network and send to @param req.
@@ -2664,7 +2847,7 @@ static esp_err_t esp_otbr_ota_upload_web_post_handler(httpd_req_t *req)
         http_status = HTTPD_400;
         error = cJSON_CreateNumber((double)ret);
         result = create_ota_result("upload_failed", NULL);
-        message = cJSON_CreateString("Failed to process the uploaded web SPIFFS image. Ensure it is exactly 200 KB.");
+        message = cJSON_CreateString("Failed to process the uploaded web SPIFFS image.");
         goto respond;
     }
 
@@ -2768,7 +2951,7 @@ exit:
 }
 
 /*-----------------------------------------------------
- Note: Advanced management API handlers
+Note: Advanced management API handlers
 -----------------------------------------------------*/
 
 static esp_err_t esp_otbr_leader_weight_get_handler(httpd_req_t *req)
@@ -3321,7 +3504,7 @@ exit:
 }
 
 /*-----------------------------------------------------
- Note：Handling for Client request
+Note: Handling for Client request
 -----------------------------------------------------*/
 static esp_err_t NOT_FOUND_handler(httpd_req_t *req)
 {
@@ -3335,7 +3518,7 @@ exit:
 }
 
 /**
- * @brief Provide the favicon for GUI.
+ * @brief Provide the OTBR icon for GUI.
  *
  * @param[in] req The request from client's browser.
  * @return
@@ -3345,15 +3528,15 @@ exit:
  *      -   ESP_ERR_HTTPD_RESP_SEND     : Error in raw send
  *      -   ESP_ERR_HTTPD_INVALID_REQ   : Invalid request
  */
-static esp_err_t favicon_get_handler(httpd_req_t *req)
+static esp_err_t otbr_png_get_handler(httpd_req_t *req)
 {
-    extern const unsigned char favicon_ico_start[] asm("_binary_favicon_ico_start");
-    extern const unsigned char favicon_ico_end[] asm("_binary_favicon_ico_end");
-    const size_t favicon_ico_size = (favicon_ico_end - favicon_ico_start);
+    extern const unsigned char otbr_png_start[] asm("_binary_otbr_png_start");
+    extern const unsigned char otbr_png_end[] asm("_binary_otbr_png_end");
+    const size_t otbr_png_size = (otbr_png_end - otbr_png_start);
 
-    ESP_RETURN_ON_ERROR(httpd_resp_set_type(req, "image/x-icon"), WEB_TAG, "Failed to set http respond type");
+    ESP_RETURN_ON_ERROR(httpd_resp_set_type(req, "image/png"), WEB_TAG, "Failed to set http respond type");
     httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=3600");
-    ESP_RETURN_ON_ERROR(httpd_resp_send(req, (const char *)favicon_ico_start, favicon_ico_size), WEB_TAG,
+    ESP_RETURN_ON_ERROR(httpd_resp_send(req, (const char *)otbr_png_start, otbr_png_size), WEB_TAG,
                         "Failed to send http respond");
     return ESP_OK;
 }
@@ -3513,9 +3696,9 @@ static esp_err_t default_urls_get_handler(httpd_req_t *req)
         return index_html_get_handler(req, index_path);
     }
 
-    /* Favicon: served from embedded binary */
-    if (strcmp(info.file_name, "/favicon.ico") == 0) {
-        return favicon_get_handler(req);
+    /* OTBR icon: served from embedded binary */
+    if (strcmp(info.file_name, "/otbr.png") == 0) {
+        return otbr_png_get_handler(req);
     }
 
     /* Extension-based routing for SPIFFS files */
@@ -3544,18 +3727,17 @@ static void ot_web_json_free(void *ptr)
 #endif
 
 /*-----------------------------------------------------
- Note：Server Start
+Note: Server Start
 -----------------------------------------------------*/
 /**
  * @brief Create an HTTP server and register an accessible URI
  *
  * @param[in] base_path A string represents the basic path of http_server files.
- * @param[in] host_ip   A IPvr4 address provided by the connected wifi, recorded by s_server.ip
  * @return
  *      -   ESP_OK: on success
  *      -   ESP_FAIL: on failure
  */
-static httpd_handle_t *start_esp_br_http_server(const char *base_path, const char *host_ip)
+static httpd_handle_t *start_esp_br_http_server(const char *base_path)
 {
     ESP_RETURN_ON_FALSE(base_path, NULL, WEB_TAG, "Invalid http server path");
 
@@ -3580,7 +3762,6 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path, const cha
     cJSON_InitHooks(&hooks);
 #endif
 
-    strcpy(s_server.ip, host_ip);
     strlcpy(s_server.data.base_path, base_path, ESP_VFS_PATH_MAX + 1);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -3606,11 +3787,6 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path, const cha
     httpd_server_register_http_uri(&s_server, s_web_gui_handlers, sizeof(s_web_gui_handlers) / sizeof(httpd_uri_t));
     httpd_register_uri_handler(s_server.handle, &default_uris_get);
 
-    // Show the login address in the console
-    ESP_LOGI(WEB_TAG, "%s\r\n", "<========server start========>");
-    ESP_LOGI(WEB_TAG, "http://%s\r\n", s_server.ip);
-    ESP_LOGI(WEB_TAG, "%s\r\n", "<============================>");
-
     return s_server.handle;
 }
 
@@ -3619,11 +3795,11 @@ void connect_handler(void *arg, esp_event_base_t event_base, int32_t event_id, v
     httpd_handle_t *server = (httpd_handle_t *)arg;
     ESP_RETURN_ON_FALSE(server, , WEB_TAG, "Http server is invalid, failed to start it");
     ESP_LOGI(WEB_TAG, "Start the web server for Openthread Border Router");
-    *server = (httpd_handle_t *)start_esp_br_http_server(base_path, s_server.ip);
+    *server = (httpd_handle_t *)start_esp_br_http_server(base_path);
 }
 
 /*-----------------------------------------------------
- Note：Server Stop
+Note: Server Stop
 -----------------------------------------------------*/
 void stop_httpserver(httpd_handle_t server)
 {
@@ -3644,7 +3820,51 @@ void disconnect_handler(void *arg, esp_event_base_t event_base, int32_t event_id
     *server = NULL;
 }
 
-static bool is_br_web_server_started = false;
+static atomic_bool is_br_web_server_started = ATOMIC_VAR_INIT(false);
+
+bool esp_br_web_is_server_started(void)
+{
+    return atomic_load(&is_br_web_server_started);
+}
+
+static void log_web_server_address(const char *hostname)
+{
+    char hostname_buffer[MDNS_NAME_BUF_LEN] = {0};
+
+    if (hostname || mdns_hostname_get(hostname_buffer) == ESP_OK) {
+        hostname = hostname ? hostname : hostname_buffer;
+        ESP_LOGI(WEB_TAG, "%s\r\n", "<========server address========>");
+        ESP_LOGI(WEB_TAG, "http://%s.local\r\n", hostname);
+        ESP_LOGI(WEB_TAG, "%s\r\n", "<================================>");
+    } else {
+        ESP_LOGW(WEB_TAG, "Cannot get the mDNS hostname, please init mDNS before Web UI");
+    }
+}
+
+static void mdns_hostname_changed_callback(const char *hostname, void *arg)
+{
+    (void)arg;
+
+    if (atomic_load(&is_br_web_server_started)) {
+        log_web_server_address(hostname);
+    }
+}
+
+static void start_web_server(const char *base_path)
+{
+    if (atomic_load(&is_br_web_server_started)) {
+        return;
+    }
+
+    if (start_esp_br_http_server(base_path) != NULL) {
+        atomic_store(&is_br_web_server_started, true);
+        log_web_server_address(NULL);
+        ESP_ERROR_CHECK(esp_event_post(ESP_BR_WEB_EVENT, ESP_BR_WEB_EVENT_SERVER_STARTED, NULL, 0, portMAX_DELAY));
+    } else {
+        ESP_LOGE(WEB_TAG, "Fail to start web server");
+    }
+}
+
 static void handler_got_ip_event(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
 #if CONFIG_OPENTHREAD_BR_SOFTAP_SETUP
@@ -3654,23 +3874,66 @@ static void handler_got_ip_event(void *arg, esp_event_base_t event_base, int32_t
         return;
     }
 #endif
-
-    if (!is_br_web_server_started) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        char ipv4_address[SERVER_IPV4_LEN];
-        sprintf((char *)ipv4_address, IPSTR, IP2STR(&event->ip_info.ip));
-        if (start_esp_br_http_server((const char *)arg, (char *)ipv4_address) != NULL) {
-            is_br_web_server_started = true;
-        } else {
-            ESP_LOGE(WEB_TAG, "Fail to start web server");
-        }
-    } else {
-        ESP_LOGW(WEB_TAG, "Web server had already been started");
-    }
+    start_web_server(arg);
 }
+
+#if CONFIG_LWIP_IPV6
+static void handler_got_ip6_event(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+#if CONFIG_OPENTHREAD_BR_SOFTAP_SETUP
+    // Don't start Thread BR web server if WiFi config mode is active
+    if (esp_br_wifi_config_is_active()) {
+        ESP_LOGI(WEB_TAG, "WiFi config mode is active, skipping Thread BR web server");
+        return;
+    }
+#endif
+
+    ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)event_data;
+    esp_ip6_addr_type_t ip6_type = esp_netif_ip6_get_addr_type(&event->ip6_info.ip);
+
+    // IP_EVENT_GOT_IP6 is emitted for every esp-netif. Ignore the Thread and link-local addresses.
+    if (event->esp_netif == esp_openthread_get_netif() || ip6_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
+        return;
+    }
+
+    start_web_server(arg);
+}
+#endif
 
 void esp_br_web_start(char *base_path)
 {
+    ESP_ERROR_CHECK(mdns_register_hostname_changed_callback(mdns_hostname_changed_callback, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &handler_got_ip_event, base_path));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &handler_got_ip_event, base_path));
+#if CONFIG_LWIP_IPV6
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_GOT_IP6, &handler_got_ip6_event, base_path));
+#endif
+}
+
+/* 9-digit TAPs only span [0, 999999999], so this is safe to use as an invalid/sentinel value. */
+#define EPSKC_TAP_INVALID 1000000000
+
+static _Atomic uint32_t s_active_epskc_tap = EPSKC_TAP_INVALID;
+
+void esp_br_web_epskc_set_active_tap(const char *tap)
+{
+    uint32_t value = EPSKC_TAP_INVALID;
+
+    if (tap != NULL && strlen(tap) == 9) {
+        value = (uint32_t)strtoul(tap, NULL, 10);
+    }
+
+    atomic_store(&s_active_epskc_tap, value);
+}
+
+bool esp_br_web_epskc_get_active_tap(char *tap_out, size_t tap_out_len)
+{
+    uint32_t value = atomic_load(&s_active_epskc_tap);
+
+    if (value == EPSKC_TAP_INVALID || tap_out == NULL || tap_out_len < 10) {
+        return false;
+    }
+
+    snprintf(tap_out, tap_out_len, "%09" PRIu32, value);
+    return true;
 }

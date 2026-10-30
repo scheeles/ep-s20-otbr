@@ -54,7 +54,7 @@ jobs:
       contents: read
 
     container:
-      image: espressif/idf:v6.0.2
+      image: espressif/idf:v6.1
 
     env:
       IDF_PATH: /opt/esp/idf
@@ -63,7 +63,10 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v7
         with:
-          submodules: "recursive"
+          # ESP-IDF ships in the container; only esp-thread-br is a workspace
+          # submodule. fetch-tags keeps `git describe` (PROJECT_VER) working.
+          fetch-depth: 1
+          fetch-tags: true
 
       # actions/checkout marks the workspace safe in a *temporary* HOME on the
       # runner, which the git inside this container never sees: it runs as a
@@ -73,7 +76,24 @@ jobs:
       # the OTA update check offer an update forever. Re-declare it here so the
       # container's git trusts the checkout and its submodules.
       - name: Trust checkout inside the build container
-        run: git config --global --add safe.directory '*'
+        run: |
+          git config --global --add safe.directory '*'
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$IDF_PATH"
+
+      - name: Prep repo for building
+        run: git submodule update --init --recursive esp-thread-br
+
+      # ESP-IDF patches live at the repository root as *.patch and are applied to
+      # the container's ESP-IDF before building.
+      - name: Apply ESP-IDF patches
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for patch in "$GITHUB_WORKSPACE"/*.patch; do
+            echo "Applying $(basename "$patch")"
+            git -C "$IDF_PATH" apply "$patch"
+          done
 
       - name: Build Dependency (ot_rcp)
         run: |
